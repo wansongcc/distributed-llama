@@ -20,6 +20,11 @@ typedef struct {
     NnSize nBytesXY;
 } NnSize3D;
 
+typedef struct {
+    NnUint* starts;     //start positions
+    NnUint* lengths;    //lengths
+} NnDimSplit;
+
 // slices
 
 typedef struct {
@@ -71,6 +76,17 @@ typedef struct {
 
 //Uneven slice
 typedef struct {
+    NnUint nNodes;
+
+    NnDimSplit headSplit;
+    NnDimSplit kvHeadSplit;
+    NnDimSplit vocabSplit;
+    NnDimSplit ffnSplit;
+    
+} NnUnevenPartitionPlan;
+
+typedef struct {
+
     NnUint kvStart;   // 在 kv 维上的起点（本节点）
     NnUint kvLen;     // 在 kv 维上的长度（本节点）
  
@@ -414,4 +430,45 @@ NnUint splitColMatmulWeight(NnColMatmulSlice *slice, NnUint nodeIndex, NnByte *w
 
 void fullfillRopeCache(const NnRopeOpConfig *config, float *cache);
 
+NnUnevenPartitionPlan createPartitionPlan(
+    NnUint nNodes,
+    const std::vector<float>& ratios,
+    NnUint globalNHeads,
+    NnUint globalNKvHeads,
+    NnUint globalVocabSize,
+    NnUint globalFfnDim
+);
+void releasePartitionPlan(NnUnevenPartitionPlan* plan);
+
+// 非均匀 Slicers
+NnKvCacheSliceUneven sliceKvCacheUneven(NnUint seqLen, NnUint headDim,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+NnMultiHeadAttSliceUneven sliceMultiHeadAttUneven(NnUint nBatches, NnUint globalNHeads, NnUint globalSeqLen,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+NnRowMatmulSliceUneven sliceRowMatmulAttUneven(NnFloatType type, NnUint globalInDim, NnUint headDim,
+    const NnDimSplit* headSplit, NnUint globalOutDim, NnUint nodeIndex);
+
+NnColMatmulSliceUneven sliceColMatmulAttUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
+    const NnUnevenPartitionPlan* plan,NnUint nodeIndex);
+
+NnRowMatmulSliceUneven sliceRowMatmulFfnUneven(NnFloatType type, NnUint globalInDim, NnUint globalFfnDim,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+NnColMatmulSliceUneven sliceColMatmulFfnUneven(NnFloatType type, NnUint globalFfnDim, NnUint globalOutDim,const NnUnevenPartitionPlan* plan,
+    NnUint nodeIndex);
+
+NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen, 
+    NnUint globalKvDim, NnUint globalNKvHeads, NnUint headDim, float ropeTheta,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+NnRowMatmulSliceUneven sliceRowMatmulLogitsUneven(NnFloatType type, NnUint globalInDim, NnUint globalVocabSize,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
+
+// (您可能还需要 logits/vocab 的 slicer，见问题 4)
+
+// 非均匀 Splitters
+NnUint splitRowMatmulWeightUneven(NnRowMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0);
+NnUint splitColMatmulWeightUneven(NnColMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0);
 #endif

@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
+#include <vector>     
+#include <numeric>    
 
 // utility functions
 
@@ -322,6 +324,362 @@ NnUint splitColMatmulWeight(NnColMatmulSlice *slice, NnUint nodeIndex, NnByte *w
     return copiedBytes;
 }
 
+//Uneven slicers
+NnDimSplit createDimSplit(NnUint totalDim, const std::vector<float>& ratios) {
+    NnUint nNodes = ratios.size();
+    if (nNodes == 0) {
+        throw std::invalid_argument("Ratios vector cannot be empty.");
+    }
+
+    NnUint* starts = new NnUint[nNodes];
+    NnUint* lengths = new NnUint[nNodes];
+
+    // 1. calculate total ratio sum
+    const float totalRatio = std::accumulate(ratios.begin(), ratios.end(), 0.0f);
+    if (totalRatio <= 0.0f) {
+        delete[] starts;
+        delete[] lengths;
+        throw std::invalid_argument("Total ratio must be greater than 0");
+    }
+
+    float cumulativeRatio = 0.0f;
+    NnUint currentOffset = 0;
+
+    // 2. iterate over each node to calculate its 'start' and 'length'
+    for (NnUint i = 0; i < nNodes; ++i) {
+        starts[i] = currentOffset;
+
+        if (i == nNodes - 1) {
+            // last node: assign all remaining dimensions to ensure total sum matches exactly
+            lengths[i] = totalDim - currentOffset;
+        } else {
+            // calculate this node's *target* end point
+            cumulativeRatio += ratios[i];
+            NnUint targetEnd = static_cast<NnUint>(
+                std::round(totalDim * (cumulativeRatio / totalRatio))
+            );
+            
+            lengths[i] = (targetEnd > currentOffset) ? (targetEnd - currentOffset) : 0;
+        }
+        currentOffset += lengths[i];
+    }
+
+    if (currentOffset != totalDim && nNodes > 0) {
+         delete[] starts;
+         delete[] lengths;
+         throw std::runtime_error("createDimSplit logic error: sum does not match totalDim.");
+    }
+
+    return NnDimSplit{starts, lengths};
+}
+
+NnUnevenPartitionPlan createPartitionPlan(
+    NnUint nNodes,
+    const std::vector<float>& ratios,
+    NnUint globalNHeads,
+    NnUint globalNKvHeads,
+    NnUint globalVocabSize,
+    NnUint globalFfnDim
+) {
+    if (nNodes == 0) {
+        throw std::invalid_argument("nNodes must be greater than 0");
+    }
+    if (nNodes != ratios.size()) {
+        throw std::invalid_argument("nNodes must match ratios.size()");
+    }
+
+    NnUnevenPartitionPlan plan;
+    plan.nNodes = nNodes;
+
+    plan.headSplit = {nullptr, nullptr};
+    plan.kvHeadSplit = {nullptr, nullptr};
+    plan.vocabSplit = {nullptr, nullptr};
+    plan.ffnSplit = {nullptr, nullptr};
+    try {
+        plan.headSplit = createDimSplit(globalNHeads, ratios);
+        plan.kvHeadSplit = createDimSplit(globalNKvHeads, ratios);
+        plan.vocabSplit = createDimSplit(globalVocabSize, ratios);
+        plan.ffnSplit = createDimSplit(globalFfnDim, ratios);
+    } catch (const std::exception& e) {
+        // --- 5. 清理 ---
+        // 如果 kvHeadSplit 创建失败, 需确保已分配的 headSplit 被释放
+        delete[] plan.headSplit.starts;
+        delete[] plan.headSplit.lengths;
+        delete[] plan.kvHeadSplit.starts;
+        delete[] plan.kvHeadSplit.lengths;
+        delete[] plan.vocabSplit.starts;
+        delete[] plan.vocabSplit.lengths;
+        delete[] plan.ffnSplit.starts;
+        delete[] plan.ffnSplit.lengths;
+        
+        // 重新抛出异常
+        throw std::runtime_error(std::string("Failed to create partition plan: ") + e.what());
+    }
+
+    return plan;
+}
+
+    
+NnKvCacheSliceUneven sliceKvCacheUneven(NnUint seqLen, NnUint headDim,
+                                        const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    NnKvCacheSliceUneven s;
+
+    // 1. 从“总蓝图”中查询本节点的 KV Head 分配
+    const NnUint kvHeadStart = plan->kvHeadSplit.starts[nodeIndex];
+    const NnUint kvHeadLen = plan->kvHeadSplit.lengths[nodeIndex];
+
+    // 2. 将 Head 分配转换为维度 (Start/Length)
+    s.kvStart = kvHeadStart * headDim;
+    s.kvLen = kvHeadLen * headDim;
+    
+    // 3. 填充兼容性/派生字段
+    s.kvDim0 = s.kvLen; // 保留以兼容旧逻辑
+
+    // 4. 计算局部缓冲区大小 (复用 size2D)
+    s.keySize = size2D(F_32, seqLen, s.kvLen);
+    s.valueSize = size2D(F_32, seqLen, s.kvLen);
+
+    return s;
+}
+
+NnMultiHeadAttSliceUneven sliceMultiHeadAttUneven(NnUint nBatches, NnUint globalNHeads, NnUint globalSeqLen,
+                                                  const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    NnMultiHeadAttSliceUneven s;
+
+    // 1. 从“总蓝图”中查询本节点的 Head 分配
+    s.headStart = plan->headSplit.starts[nodeIndex];
+    s.headLen = plan->headSplit.lengths[nodeIndex];
+
+    // 2. 填充兼容性/派生字段
+    s.nHeads = globalNHeads; // 全局 Head 总数
+    s.nHeads0 = s.headLen;   // 局部 Head 数量
+
+    // 3. 计算局部缓冲区大小 (复用 size2D)
+    s.attSize = size2D(F_32, nBatches, s.headLen * globalSeqLen); 
+
+    return s;
+}
+
+//uesd for q,k,v projection weight slicing
+NnRowMatmulSliceUneven sliceRowMatmulAttUneven(NnFloatType type, NnUint globalInDim, NnUint headDim,
+                                               const NnDimSplit* headSplit, 
+                                               NnUint globalOutDim, NnUint nodeIndex) {
+    NnRowMatmulSliceUneven s;
+    s.type = type;
+
+    // 1. 从 Head 蓝图中获取分配
+    const NnUint headStart = headSplit->starts[nodeIndex];
+    const NnUint headLen = headSplit->lengths[nodeIndex];
+
+    // 2. 转换为维度，并填入 'inStart'/'inLen' 字段
+    s.inStart = headStart * headDim;
+    s.inLen = headLen * headDim;
+
+    // 3. 填充兼容性/派生字段
+    s.d0 = s.inLen;   // d0 是局部输出维度
+    s.n = globalInDim; // n 是完整输入维度
+    
+    // 4. 计算尺寸 (复用 size2D)
+    s.size = size2D(type, s.n, globalOutDim);  // 完整权重矩阵的大小
+    s.sliceSize = size2D(type, s.n, s.d0);     // 本节点切片的大小
+
+    return s;
+}
+
+//wo
+NnColMatmulSliceUneven sliceColMatmulAttUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
+                                               const NnUnevenPartitionPlan* plan, 
+                                               NnUint nodeIndex) {
+    NnColMatmulSliceUneven s;
+    s.type = type;
+
+    // 1. 从 Head 蓝图 (headSplit) 获取分配
+    const NnUint headStart = plan->headSplit.starts[nodeIndex];
+    const NnUint headLen = plan->headSplit.lengths[nodeIndex];
+    
+    // 2. 转换为维度，并填入 'outStart'/'outLen' 字段
+    s.outStart = headStart * headDim;
+    s.outLen = headLen * headDim;
+
+    // 3. 填充兼容性/派生字段
+    s.n = globalInDimQ; // n 是完整输入维度
+    s.n0 = s.outLen;    // n0 是局部输入维度
+    s.d = globalOutDim; // d 是完整输出维度
+
+    // 4. 计算尺寸 (复用 size2D)
+    s.size = size2D(type, s.n, s.d);
+    s.sliceSize = size2D(type, s.n0, s.d);
+
+    return s;
+}
+
+//ffn
+NnRowMatmulSliceUneven sliceRowMatmulFfnUneven(NnFloatType type, NnUint globalInDim, NnUint globalFfnDim,
+                                               const NnUnevenPartitionPlan* plan, 
+                                               NnUint nodeIndex) {
+    NnRowMatmulSliceUneven s;
+    s.type = type;
+
+    // 1. 从 FFN 蓝图中获取分配 (不再乘以 headDim)
+    s.inStart = plan->ffnSplit.starts[nodeIndex];
+    s.inLen = plan->ffnSplit.lengths[nodeIndex];
+
+    // 2. 填充兼容性/派生字段
+    s.d0 = s.inLen;   // d0 是局部输出维度
+    s.n = globalInDim; // n 是完整输入维度 (h->dim)
+
+    // 3. 计算尺寸
+    s.size = size2D(type, s.n, globalFfnDim);
+    s.sliceSize = size2D(type, s.n, s.d0);
+
+    return s;
+}
+
+
+NnColMatmulSliceUneven sliceColMatmulFfnUneven(NnFloatType type, NnUint globalFfnDim, NnUint globalOutDim,
+                                               const NnUnevenPartitionPlan* plan, 
+                                               NnUint nodeIndex) {
+    NnColMatmulSliceUneven s;
+    s.type = type;
+
+    // 1. 从 FFN 蓝图中获取分配 (不再乘以 headDim)
+    s.outStart = plan->ffnSplit.starts[nodeIndex];
+    s.outLen = plan->ffnSplit.lengths[nodeIndex];
+
+    // 3. 填充兼容性/派生字段
+    s.n = globalFfnDim; // n 是完整输入维度
+    s.n0 = s.outLen;    // n0 是局部输入维度
+    s.d = globalOutDim; // d 是完整输出维度 (h->dim)
+
+    // 4. 计算尺寸
+    s.size = size2D(type, s.n, s.d);
+    s.sliceSize = size2D(type, s.n0, s.d);
+
+    return s;
+}
+
+NnRowMatmulSliceUneven sliceRowMatmulLogitsUneven(NnFloatType type, NnUint globalInDim, NnUint globalVocabSize,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    NnRowMatmulSliceUneven s;
+    s.type = type;
+    s.inStart = plan->vocabSplit.starts[nodeIndex];
+    s.inLen = plan->vocabSplit.lengths[nodeIndex];
+    s.d0 = s.inLen;
+    s.n = globalInDim;
+    s.size = size2D(type, s.n, globalVocabSize);
+    s.sliceSize = size2D(type, s.n, s.d0);
+    return s;
+}
+
+NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen, 
+                                  NnUint globalKvDim, NnUint globalNKvHeads, NnUint headDim, float ropeTheta,
+                                  const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    NnRopeSliceUneven s;
+
+    // --- 1. Q 侧 (来自 headSplit) ---
+    const NnUint qHeadStart = plan->headSplit.starts[nodeIndex];
+    s.qDimLen = plan->headSplit.lengths[nodeIndex] * headDim;
+    s.qDimStart = qHeadStart * headDim;
+    s.qDim0 = s.qDimLen; // 兼容字段
+
+    // --- 2. KV 侧 (来自 kvHeadSplit) ---
+    const NnUint kvHeadStart = plan->kvHeadSplit.starts[nodeIndex];
+    s.kvDimLen = plan->kvHeadSplit.lengths[nodeIndex] * headDim;
+    s.kvDimStart = kvHeadStart * headDim;
+    s.kvDim0 = s.kvDimLen; // 兼容字段
+
+    // --- 3. 填充其它参数 ---
+    s.kvDim = globalKvDim;
+    s.nKvHeads = globalNKvHeads;
+    s.seqLen = seqLen;
+    s.headDim = headDim;
+    s.ropeTheta = ropeTheta;
+
+    // --- 4. 计算派生字段和 Cache (复用均匀 sliceRope 逻辑) ---
+    if (type == ROPE_LLAMA || type == ROPE_LLAMA3_1) {
+        s.qShift = s.qDimStart - s.kvDimStart;
+        NnUint qDimEnd = s.qDimStart + s.qDimLen;
+        s.sliceDim = qDimEnd - s.kvDimStart; 
+        assert(s.sliceDim % 2 == 0);
+        s.cacheSize = size2D(F_32, seqLen, s.sliceDim);
+    } else if (type == ROPE_FALCON) {
+        s.sliceDim = headDim;
+        s.cacheSize = size2D(F_32, seqLen, headDim);
+    } else {
+        throw std::invalid_argument("Unsupported rope type");
+    }
+    return s;
+}
+
+//Uneven sllitter weight functions
+NnUint splitRowMatmulWeightUneven(NnRowMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0) {
+    NnSize blockSize = getBlockSize(slice->type);
+    NnSize batchBytes = getBytes(slice->type, blockSize);
+    assert(slice->n % blockSize == 0); // 'n' 是全局输入维度
+
+    // 1. 计算一个完整“列”中的块数
+    NnSize n_blocks_per_column = slice->n / blockSize;
+    
+    // 2. 计算一个完整“列”的字节大小
+    NnSize column_bytes = n_blocks_per_column * batchBytes;
+
+    // 3. (关键) 计算源 (weight) 的起始偏移量
+    // 偏移量 = 起始列索引 * 单个列的字节大小
+    NnSize offset = slice->inStart * column_bytes;
+    
+    NnSize copiedBytes = 0;
+    
+    // 4. 循环复制本节点负责的 'inLen' (或 d0) 个列
+    for (NnUint d = 0; d < slice->inLen; d++) {
+        for (NnUint j = 0; j < n_blocks_per_column; j++) {
+            // o = 目标缓冲区(weight0)中的局部偏移量
+            NnSize o = (d * n_blocks_per_column + j) * batchBytes; 
+            // offset + o = 源缓冲区(weight)中的全局偏移量
+            std::memcpy(weight0 + o, weight + offset + o, batchBytes);
+            copiedBytes += batchBytes;
+        }
+    }
+    return copiedBytes;
+}
+
+NnUint splitColMatmulWeightUneven(NnColMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0) {
+    NnSize blockSize = getBlockSize(slice->type);
+    NnSize batchBytes = getBytes(slice->type, blockSize);
+
+    // 1. 验证切分是块对齐的
+    assert(slice->outLen % blockSize == 0); // 局部长度
+    assert(slice->outStart % blockSize == 0); // 全局起始点
+    assert(slice->n % blockSize == 0);      // 全局总高度
+
+    // 2. 计算“完整”权重中一列的字节大小
+    NnSize n_global_blocks = slice->n / blockSize;
+    NnSize rowBytes = n_global_blocks * batchBytes; 
+    
+    // 3. 计算“局部”权重中一列的字节大小
+    NnSize n_local_blocks = slice->outLen / blockSize;
+    NnSize row0Bytes = n_local_blocks * batchBytes;
+
+    // 4. (关键) 计算源 (weight) 中要复制的“起始行”的字节偏移量
+    NnSize start_block = slice->outStart / blockSize;
+    NnSize rowOffsetBytes = start_block * batchBytes;
+
+    NnSize copiedBytes = 0;
+    
+    // 5. 遍历每一列 'd'
+    for (NnUint d = 0; d < slice->d; d++) {
+        // 目标: 局部缓冲区(weight0) 的第 'd' 列的开头
+        NnByte* dest = &weight0[row0Bytes * d];
+        // 源: 完整缓冲区(weight) 的第 'd' 列, 再偏移 'rowOffsetBytes' (起始行)
+        NnByte* src = &weight[rowBytes * d + rowOffsetBytes];
+        
+        // 一次性复制这一列中属于本节点的所有行
+        std::memcpy(dest, src, row0Bytes);
+        copiedBytes += row0Bytes;
+    }
+    return copiedBytes;
+}
+
+
 // helper
 
 static inline float scaleFrequencyLlama3(const float freq, const NnRopeOpConfig *config) {
@@ -381,4 +739,28 @@ void fullfillRopeCache(const NnRopeOpConfig *config, float *cache) {
         fullfillRopeFalconCache(config, cache);
     else
         throw std::invalid_argument("Unsupported rope type");
+}
+
+//release uneven partition plan
+void releasePartitionPlan(NnUnevenPartitionPlan* plan) {
+    if (plan == nullptr) return;
+
+    delete[] plan->headSplit.starts;
+    delete[] plan->headSplit.lengths;
+    
+    delete[] plan->kvHeadSplit.starts;
+    delete[] plan->kvHeadSplit.lengths;
+
+    delete[] plan->vocabSplit.starts;
+    delete[] plan->vocabSplit.lengths;
+
+    delete[] plan->ffnSplit.starts;
+    delete[] plan->ffnSplit.lengths;
+
+    // 将指针设为 null 以防止重复释放
+    plan->headSplit = {nullptr, nullptr};
+    plan->kvHeadSplit = {nullptr, nullptr};
+    plan->vocabSplit = {nullptr, nullptr};
+    plan->ffnSplit = {nullptr, nullptr};
+    plan->nNodes = 0;
 }
