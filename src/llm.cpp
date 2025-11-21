@@ -604,9 +604,290 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     return n;
 }
 
-LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
+LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std::vector<float>& ratios) {
     //TODO implement uneven slicing
+    NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
+    NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
+    NnUint ffDim = h->hiddenDim;
     LlmNet n;
+
+    //TODO QWEN3_MOE
+
+
+    //Create uneven plan
+    NnUnevenPartitionPlan plan = createPartitionPlan(
+        nNodes,
+        ratios,
+        h->nHeads,
+        h->nKvHeads,
+        h->vocabSize,
+        ffDim
+    );    
+    n.tokenEmbeddingSize = size2D(F_32, h->vocabSize, h->dim);
+    n.rmsNormSize = size1D(F_32, h->dim);
+    n.qkRmsNormSize = size1D(F_32, h->headDim);
+    n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
+
+    NnNetConfigBuilder netBuilder(nNodes, nBatches);
+    n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
+    n.tokenPipeIndex = netBuilder.addPipe("TOK", size2D(F_32, nBatches, 1));
+    n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
+    n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
+    const NnUint zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nNodes));
+
+    netBuilder.addPreSync(n.positionPipeIndex);
+
+    n.header = h;
+    n.netConfig = netBuilder.build();
+    n.nodeConfigs = new NnNodeConfig[nNodes];
+
+    for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+        NnKvCacheSliceUneven kvCacheSlice = sliceKvCacheUneven(h->seqLen, h->headDim, &plan, nodeIndex);
+        NnMultiHeadAttSliceUneven multiHeadAttSlice = sliceMultiHeadAttUneven(nBatches, h->nHeads, h->seqLen, &plan, nodeIndex);
+        
+        NnRowMatmulSliceUneven qSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan.headSplit, h->qDim, nodeIndex);
+        NnRowMatmulSliceUneven kSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan.kvHeadSplit, h->kvDim, nodeIndex);
+        NnRowMatmulSliceUneven vSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan.kvHeadSplit, h->kvDim, nodeIndex);
+        NnColMatmulSliceUneven woSlice = sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, &plan, nodeIndex);
+
+        NnRowMatmulSliceUneven w1Slice = sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, &plan, nodeIndex);
+        NnColMatmulSliceUneven w2Slice = sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, &plan, nodeIndex);
+        NnRowMatmulSliceUneven w3Slice = sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, &plan, nodeIndex);
+        NnRowMatmulSliceUneven wclsSlice = sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, &plan, nodeIndex);
+
+        NnRopeSliceUneven unevenRope = sliceRopeUneven(h->ropeType, h->seqLen, h->kvDim, h->nKvHeads, h->headDim, h->ropeTheta, &plan, nodeIndex);
+        NnRopeSlice ropeSlice;
+        {
+            ropeSlice.qDim0 = unevenRope.qDimLen;
+            ropeSlice.qDimStart = unevenRope.qDimStart;
+            ropeSlice.qDimEnd = unevenRope.qDimStart + unevenRope.qDimLen;
+            ropeSlice.qShift = unevenRope.qShift;
+            ropeSlice.kvDim = unevenRope.kvDim;
+            ropeSlice.kvDim0 = unevenRope.kvDimLen;
+            ropeSlice.kvDimStart = unevenRope.kvDimStart;
+            ropeSlice.sliceDim = unevenRope.sliceDim;
+            ropeSlice.seqLen = unevenRope.seqLen;
+            ropeSlice.headDim = unevenRope.headDim;
+            ropeSlice.ropeTheta = unevenRope.ropeTheta;
+            ropeSlice.cacheSize = unevenRope.cacheSize;
+        }
+
+        NnUint nQNormColumns = 1;
+        NnUint nKNormColumns = 1;
+        NnUint nInvBufferColumns = 1;
+        if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+            assert(qSlice.inLen % h->headDim == 0); // 使用 'inLen' (局部长度)
+            assert(kSlice.inLen % h->headDim == 0);
+            nQNormColumns = qSlice.inLen / h->headDim;
+            nKNormColumns = kSlice.inLen / h->headDim;
+            nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
+        }
+
+        NnNodeConfigBuilder nodeBuilder(nodeIndex);
+
+        const NnUint xBufferIndex = nodeBuilder.addBuffer("x", size2D(F_32, nBatches, h->dim));
+        const NnUint yBufferIndex = nodeBuilder.addBuffer("y", size2D(F_32, nBatches, h->dim));
+        const NnUint yqBufferIndex = (h->syncType == F_32)
+            ? yBufferIndex
+            : nodeBuilder.addBuffer("q_y", size2D(h->syncType, nBatches, h->dim));
+
+        // (逻辑简化：合并 zBufferIndex 和 zqSliceBufferIndex 为一个缓冲区)
+        const NnUint mhaOutBufferIndex = nodeBuilder.addBuffer("mha_out", size2D(F_32, nBatches, qSlice.inLen));
+        const NnUint mhaOutQBufferIndex = (h->syncType == F_32)
+            ? mhaOutBufferIndex
+            : nodeBuilder.addBuffer("q_mha_out", size2D(h->syncType, nBatches, qSlice.inLen));
+        
+        const NnUint qBufferIndex = nodeBuilder.addBuffer("q", size2D(F_32, nBatches, qSlice.inLen));
+        const NnUint kTempBufferIndex = nodeBuilder.addBuffer("k_temp", size2D(F_32, nBatches, kSlice.inLen));
+        const NnUint vTempBufferIndex = nodeBuilder.addBuffer("v_temp", size2D(F_32, nBatches, vSlice.inLen));
+
+        const NnUint invRmsBufferIndex = nodeBuilder.addBuffer("inv_rms", size2D(F_32, nBatches, nInvBufferColumns));
+
+        const NnUint ropeCacheBufferIndex = nodeBuilder.addBuffer("rope_cache", ropeSlice.cacheSize); // 使用适配后的
+        const NnUint attBufferIndex = nodeBuilder.addBuffer("att", multiHeadAttSlice.attSize); // 使用局部的
+        const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer("lg", size2D(F_32, nBatches, wclsSlice.inLen));
+
+        // not moe
+        const NnUint dBufferIndex = nodeBuilder.addBuffer("d", size2D(F_32, nBatches, w1Slice.inLen));
+        const NnUint dqBufferIndex = (h->syncType == F_32)
+            ? dBufferIndex
+            : nodeBuilder.addBuffer("q_d", size2D(h->syncType, nBatches, w1Slice.inLen));
+        const NnUint lBufferIndex = nodeBuilder.addBuffer("l", size2D(F_32, nBatches, w3Slice.inLen));
+
+        // moe (缓冲区大小现在基于 w1Slice.inLen)
+        const NnUint moeGtBufferIndex = nodeBuilder.addBuffer("gt", size2D(F_32, nBatches, nExpertsOr1));
+        const NnUint moeExpertIndexesBufferIndex = nodeBuilder.addBuffer("act_exp_ix", size2D(F_32, nBatches, nActiveExpertsOr1));
+        const NnUint moeYBufferIndex = nodeBuilder.addBuffer("moe_y", size3D(F_32, nActiveExpertsOr1, nBatches, h->dim));
+        const NnUint moeYqBufferIndex = (h->syncType == F_32)
+            ? moeYBufferIndex
+            : nodeBuilder.addBuffer("q_moe_y", size3D(h->syncType, nActiveExpertsOr1, nBatches, h->dim));
+        
+        const NnUint moeDBufferIndex = nodeBuilder.addBuffer("moe_d", size3D(F_32, nActiveExpertsOr1, nBatches, w1Slice.inLen));
+        const NnUint moeDQBufferIndex = (h->syncType == F_32)
+            ? moeDBufferIndex
+            : nodeBuilder.addBuffer("q_moe_d", size3D(h->syncType, nActiveExpertsOr1, nBatches, w1Slice.inLen));
+        const NnUint moeLBufferIndex = nodeBuilder.addBuffer("moe_l", size3D(F_32, nActiveExpertsOr1, nBatches, w3Slice.inLen));
+        const NnUint moeSBufferIndex = nodeBuilder.addBuffer("moe_s", size3D(F_32, nActiveExpertsOr1, nBatches, 1));
+
+        NnSegmentConfigBuilder start;
+        if (nodeIndex == 0) {
+            start.addOp(OP_EMBEDDING, "embedding", 0, 
+                pointerBatchConfig(SRC_PIPE, n.tokenPipeIndex),
+                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
+                n.tokenEmbeddingSize, NnEmbeddingOpConfig{});
+        }
+        start.addSync(n.xPipeIndex, SYNC_WITH_ROOT);
+        nodeBuilder.addSegment(start.build());
+
+        for (NnUint layerIndex = 0; layerIndex < h->nLayers; layerIndex++) {
+            // (修改) 缓冲区大小基于局部的 kvCacheSlice
+            const NnUint kBufferIndex = nodeBuilder.addBuffer("k", kvCacheSlice.keySize);
+            const NnUint vBufferIndex = nodeBuilder.addBuffer("v", kvCacheSlice.valueSize);
+
+            NnSegmentConfigBuilder att;
+            NnSegmentConfigBuilder ff;
+
+            // att (同上)
+            if (layerIndex == 0) {
+                att.addOp(OP_CAST, "block_cast_x", layerIndex, pointerBatchConfig(SRC_PIPE, n.xPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnCastOpCodeConfig{});
+            } else {
+                att.addOp(OP_MERGE_ADD, "block_merge_add", layerIndex, pointerBatchConfig(SRC_PIPE, zqPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnMergeAddOpCodeConfig{});
+            }
+            att.addOp(OP_INV_RMS, "block_norm_pre_0", layerIndex, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+            att.addOp(OP_RMS_NORM, "block_norm_0", layerIndex, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), n.rmsNormSize, NnRmsNormOpConfig{invRmsBufferIndex, 1});
+            if (yBufferIndex != yqBufferIndex) {
+                att.addOp(OP_CAST, "block_cast_y", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
+            }
+
+            // (修改) Matmul Op 现在使用局部的 sliceSize
+            att.addOp(OP_MATMUL, "block_matmul_q", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), qSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            att.addOp(OP_MATMUL, "block_matmul_k", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), kSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            att.addOp(OP_MATMUL, "block_matmul_v", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), vSlice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+
+            // (修改) Qwen Norms 使用局部的 nQNormColumns, nKNormColumns
+            if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+                att.addOp(OP_INV_RMS, "block_norm_pre_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nQNormColumns});
+                att.addOp(OP_RMS_NORM, "block_norm_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nQNormColumns});
+                att.addOp(OP_INV_RMS, "block_norm_pre_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, nKNormColumns});
+                att.addOp(OP_RMS_NORM, "block_norm_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), size2D(F_32, 1, h->headDim), NnRmsNormOpConfig{invRmsBufferIndex, nKNormColumns});
+            }
+
+            // (修改) RoPE Op 使用适配后的 (但仍是局部的) ropeSlice
+            att.addOp(OP_ROPE, "block_rope_q", layerIndex, pointerBatchConfig(SRC_BUFFER, qBufferIndex), pointerBatchConfig(SRC_BUFFER, qBufferIndex), size0(), NnRopeOpConfig{h->ropeType, 1, n.positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
+            att.addOp(OP_ROPE, "block_rope_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), size0(), NnRopeOpConfig{h->ropeType, 0, n.positionPipeIndex, ropeCacheBufferIndex, h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen, ropeSlice});
+            
+            // (不变) Shift Ops
+            att.addOp(OP_SHIFT, "block_shift_k", layerIndex, pointerBatchConfig(SRC_BUFFER, kTempBufferIndex), pointerRawConfig(SRC_BUFFER, kBufferIndex), size0(), NnShiftOpCodeConfig{n.positionPipeIndex});
+            att.addOp(OP_SHIFT, "block_shift_v", layerIndex, pointerBatchConfig(SRC_BUFFER, vTempBufferIndex), pointerRawConfig(SRC_BUFFER, vBufferIndex), size0(), NnShiftOpCodeConfig{n.positionPipeIndex});
+
+            // (修改) MHA Op 使用局部的 multiHeadAttSlice, qSlice, kvCacheSlice
+            att.addOp(OP_MULTIHEAD_ATT, "block_multihead_att", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), // 输出到局部的 mhaOutBufferIndex
+                pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex), // (保持配置为in/out相同，即使我们只用输出)
+                size0(),
+                NnMultiHeadAttOpConfig{
+                    multiHeadAttSlice.nHeads, multiHeadAttSlice.headLen, // (global, local)
+                    h->nKvHeads, h->headDim, h->seqLen, 
+                    qSlice.inLen, kvCacheSlice.kvLen, // (local q dim, local kv dim)
+                    n.positionPipeIndex, qBufferIndex, kBufferIndex, vBufferIndex, attBufferIndex
+                });
+            
+            // (修改) Cast 到量化缓冲区 (如果需要)
+            if (mhaOutBufferIndex != mhaOutQBufferIndex) {
+                 att.addOp(OP_CAST, "block_cast_y2", layerIndex,
+                    pointerBatchConfig(SRC_BUFFER, mhaOutBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
+
+            // (修改) Matmul Op 使用局部的 mhaOutQBufferIndex 和 woSlice.sliceSize
+            att.addOp(OP_MATMUL, "block_matmul_wo", layerIndex,
+                pointerBatchConfig(SRC_BUFFER, mhaOutQBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                woSlice.sliceSize,
+                NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            
+            // (不变) Cast 和 Sync
+            att.addOp(OP_CAST, "block_cast_d", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex), size0(), NnCastOpCodeConfig{});
+            att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
+
+            // ff (同上)
+            ff.addOp(OP_MERGE_ADD, "block_merge_add2", layerIndex, pointerBatchConfig(SRC_PIPE, zqPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnMergeAddOpCodeConfig{});
+            ff.addOp(OP_INV_RMS, "block_norm_pre_1", layerIndex, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+            ff.addOp(OP_RMS_NORM, "block_norm_1", layerIndex, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), n.rmsNormSize, NnRmsNormOpConfig{invRmsBufferIndex, 1});
+
+            if (h->archType == QWEN3_MOE) {
+                // (MoE 逻辑... Matmul Op 尺寸已根据局部 w1Slice/w3Slice 自动更新)
+                ff.addOp(OP_REPEAT_Z, "block_moe_y_repeat", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), size0(), NnRepeatZOpCodeConfig{});
+                ff.addOp(OP_MATMUL, "block_moe_gate", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), n.moeGateSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                ff.addOp(OP_SOFTMAX, "block_moe_softmax", layerIndex, pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), size0(), NnSoftmaxOpCodeConfig{});
+                ff.addOp(OP_MOE_GATE, "block_moe_gate2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeGtBufferIndex), pointerBatchConfig(SRC_BUFFER, moeSBufferIndex), size0(), NnMoeGateOpCodeConfig{h->nActiveExperts, 1u, moeExpertIndexesBufferIndex});
+                
+                // (修改) MoE Matmul Ops 使用局部的 sliceSize
+                NnSize3D w1ExpertSliceSize = size3D(h->weightType, h->nExperts, w1Slice.n, w1Slice.inLen);
+                NnSize3D w3ExpertSliceSize = size3D(h->weightType, h->nExperts, w3Slice.n, w3Slice.inLen);
+                NnSize3D w2ExpertSliceSize = size3D(h->weightType, h->nExperts, w2Slice.n0, w2Slice.d);
+
+                ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), w1ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+                ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYqBufferIndex), pointerBatchConfig(SRC_BUFFER, moeLBufferIndex), w3ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+                
+                ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnSiluOpCodeConfig{});
+                ff.addOp(OP_MUL, "block_mul", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), size0(), NnMulOpCodeConfig{moeLBufferIndex});
+                if (moeDBufferIndex != moeDQBufferIndex) {
+                    ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDBufferIndex), pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), size0(), NnCastOpCodeConfig{});
+                }
+                ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, moeDQBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), w2ExpertSliceSize, NnMatmulOpConfig{h->nExperts, h->nActiveExperts, moeExpertIndexesBufferIndex});
+                ff.addOp(OP_SCALE, "block_moe_scale", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), size0(), NnScaleOpCodeConfig{moeSBufferIndex});
+                ff.addOp(OP_MERGE_SUM, "block_moe_merge_sum", layerIndex, pointerBatchConfig(SRC_BUFFER, moeYBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), size0(), NnMergeSumOpCodeConfig{});
+            } else {
+                // (非 MoE FFN)
+                if (yBufferIndex != yqBufferIndex) {
+                    ff.addOp(OP_CAST, "block_cast_y3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
+                }
+                // (修改) Matmul Ops 使用局部的 sliceSize
+                ff.addOp(OP_MATMUL, "block_matmul_w1", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), w1Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                ff.addOp(OP_MATMUL, "block_matmul_w3", layerIndex, pointerBatchConfig(SRC_BUFFER, yqBufferIndex), pointerBatchConfig(SRC_BUFFER, lBufferIndex), w3Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+                
+                ff.addOp(OP_SILU, "block_act", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnSiluOpCodeConfig{});
+                ff.addOp(OP_MUL, "block_mul", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dBufferIndex), size0(), NnMulOpCodeConfig{lBufferIndex});
+                if (dBufferIndex != dqBufferIndex) {
+                    ff.addOp(OP_CAST, "block_cast_d2", layerIndex, pointerBatchConfig(SRC_BUFFER, dBufferIndex), pointerBatchConfig(SRC_BUFFER, dqBufferIndex), size0(), NnCastOpCodeConfig{});
+                }
+                ff.addOp(OP_MATMUL, "block_matmul_w2", layerIndex, pointerBatchConfig(SRC_BUFFER, dqBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), w2Slice.sliceSize, NnMatmulOpConfig{0, 0, moeExpertIndexesBufferIndex});
+            }
+            ff.addOp(OP_CAST, "block_cast_d3", layerIndex, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex), size0(), NnCastOpCodeConfig{});
+            ff.addSync(zqPipeIndex, SYNC_NODE_SLICES);
+
+            nodeBuilder.addSegment(att.build());
+            nodeBuilder.addSegment(ff.build());
+        }
+        NnSegmentConfigBuilder end;
+        end.addOp(OP_MERGE_ADD, "final_merge_add", 0, pointerBatchConfig(SRC_PIPE, zqPipeIndex), pointerBatchConfig(SRC_BUFFER, xBufferIndex), size0(), NnMergeAddOpCodeConfig{});
+        end.addOp(OP_INV_RMS, "final_norm_pre", 0, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex), size0(), NnInvRmsOpConfig{h->normEpsilon, 1});
+        end.addOp(OP_RMS_NORM, "final_norm", 0, pointerBatchConfig(SRC_BUFFER, xBufferIndex), pointerBatchConfig(SRC_BUFFER, yBufferIndex), n.rmsNormSize, NnRmsNormOpConfig{invRmsBufferIndex, 1});
+        if (yBufferIndex != yqBufferIndex) {
+            end.addOp(OP_CAST, "final_cast_y", 0, pointerBatchConfig(SRC_BUFFER, yBufferIndex), pointerBatchConfig(SRC_BUFFER, yqBufferIndex), size0(), NnCastOpCodeConfig{});
+        }
+        
+        // (修改) Logits Matmul 使用局部的 wclsSlice.sliceSize
+        end.addOp(OP_MATMUL, "final_matmul_logits", 0,
+            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+            wclsSlice.sliceSize,
+            NnMatmulOpConfig{});
+        
+        end.addOp(OP_CAST, "final_cast_logits", 0,
+            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+            pointerBatchedSliceConfig(SRC_PIPE, n.logitsPipeIndex),
+            size0(), NnCastOpCodeConfig{});
+        end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
+
+        nodeBuilder.addSegment(end.build());
+        n.nodeConfigs[nodeIndex] = nodeBuilder.build();
+    }
+
+    releasePartitionPlan(&plan);
+
     return  n;
 }
 

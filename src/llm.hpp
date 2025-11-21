@@ -139,6 +139,7 @@ typedef struct {
 LlmHeader loadLlmHeader(const char* path, const unsigned int maxSeqLen, NnFloatType syncType);
 void printLlmHeader(LlmHeader *header);
 LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
+LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std::vector<float>& ratios);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
 

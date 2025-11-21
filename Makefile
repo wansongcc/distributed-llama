@@ -88,14 +88,9 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 # [TAB] <-- 这一行必须以 TAB 开始！
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
-
-# --- (您的新运行命令) ---
-run-uneven-test: uneven-slice-test
-# [TAB] <-- 这一行必须以 TAB 开始！
-	@echo "--- 运行非均匀切分单元测试 ---"
-# [TAB] <-- 这一行必须以 TAB 开始！
-	./uneven-slice-test
 dllama: src/dllama.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
+	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
+uneven-llm-build-test: src/test/test_UnevenLlmBuild.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)

@@ -35,11 +35,14 @@ public:
     int gpuSegmentFrom;
     int gpuSegmentTo;
 
+    char *ratiosStr; 
+
     // worker
     NnUint port;
 
     static AppCliArgs parse(int argc, char **argv, bool hasMode);
     ~AppCliArgs();
+
 };
 
 typedef struct {

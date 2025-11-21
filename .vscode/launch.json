@@ -55,7 +55,29 @@
         { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
         { "description": "Set disassembly flavor to intel", "text": "-gdb-set disassembly-flavor intel", "ignoreFailures": true }
       ]
-    }
+    },
+    {
+    "name": "Test Uneven Builder (ASan)",
+    "type": "cppdbg",
+    "request": "launch",
+    "program": "/workspace/distributed-llama/uneven-llm-build-test",
+    "args": [
+        "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
+        "--ratios", "1.0,3.0,2.0"
+    ],
+    "cwd": "/workspace/distributed-llama",
+    "stopAtEntry": false,
+    "externalConsole": false,
+    "MIMode": "gdb",
+    "miDebuggerPath": "/usr/bin/gdb",
+    "environment": [
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+    ],
+    "setupCommands": [
+        { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "description": "Set disassembly flavor to intel", "text": "-gdb-set disassembly-flavor intel", "ignoreFailures": true }
+    ]
+  }
   ]
   
 }

@@ -1,6 +1,10 @@
 #include "app.hpp"
 #include <cassert>
 #include <cstring>
+#include <sstream>
+#include <numeric>
+#include <cmath>
+#include <vector>
 #include <stdexcept>
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
@@ -46,6 +50,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
+    args.ratiosStr = nullptr;
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -95,6 +100,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             }
 
             i += count - 1;
+        } else if (strcmp(argv[i], "--ratios") == 0) {
+            if (++i >= argc) throw std::runtime_error("--ratios requires an argument (e.g., \"1.0,3.0\")");
+            args.ratiosStr = argv[i];
         } else if (std::strcmp(name, "--port") == 0) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
@@ -139,6 +147,30 @@ AppCliArgs::~AppCliArgs() {
     }
     if (workerPorts != nullptr)
         delete[] workerPorts;
+}
+
+static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
+    if (ratiosStr == nullptr) {
+        throw std::invalid_argument("Ratios 字符串不能为空");
+    }
+    std::vector<float> ratios;
+    std::string s(ratiosStr);
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        try {
+            ratios.push_back(std::stof(item));
+        } catch (const std::exception& e) {
+            throw std::invalid_argument(std::string("无效的比例值: ") + item);
+        }
+    }
+    if (ratios.size() != nNodes) {
+        throw std::invalid_argument(
+            std::string("Ratios 数量 (") + std::to_string(ratios.size()) + 
+            std::string(") 必须等于节点总数 (nNodes = ") + std::to_string(nNodes) + ")"
+        );
+    }
+    return ratios;
 }
 
 static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution) {
@@ -228,7 +260,6 @@ bool WorkerLlmInference::tryReadControlPacket() {
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
-
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
     if (nNodes > header.nKvHeads)
         // TODO: https://github.com/b4rtaz/distributed-llama/issues/70
@@ -242,7 +273,16 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     Sampler sampler(tokenizer.vocabSize, args->temperature, args->topp, args->seed);
 
-    LlmNet net = buildLlmNet(&header, nNodes, args->nBatches);
+    LlmNet net;
+    if(args->ratiosStr != nullptr){
+        std::vector<float> ratios = parseRatios(args->ratiosStr, nNodes);
+        net = buildLlmNetUneven(&header, nNodes, args->nBatches, ratios);
+        if (args->info) {
+            printf("⚖️  Uneven partitioning strategy enabled: %s\n", args->ratiosStr);
+        }
+    }else{
+        net = buildLlmNet(&header, nNodes, args->nBatches);
+    }
     std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
