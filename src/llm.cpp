@@ -1,11 +1,13 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
+#include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
 #include "mmap.hpp"
 #include "llm.hpp"
 #include <cerrno>
 #include <stdexcept>
+#include <functional>
 
 static const char *hiddenActToString(LlmHiddenAct act) {
     if (act == HIDDEN_ACT_GELU) return "Gelu";
@@ -161,7 +163,6 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.rmsNormSize = size1D(F_32, h->dim);
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
-
     NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes); //KVslice
     NnMultiHeadAttSlice multiHeadAttSlice = sliceMultiHeadAtt(h->nHeads, h->seqLen, nNodes, nBatches);
 
@@ -951,6 +952,123 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     if (missingBytes != 0u)
         throw std::runtime_error("Missing bytes in weight file: " + std::to_string(missingBytes));
     printf("💿 Weights loaded\n");
+
+    loader->finish();
+}
+
+void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan) {
+    MmapFile file;
+    openMmapFile(&file, path, net->header->fileSize);
+    
+    // 简单的文件完整性检查
+
+    std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
+    printf("💿 Loading weights (Uneven Partitioning)...\n");
+
+
+    Timer timer;
+    NnByte *data = (NnByte *)file.data;
+    NnByte *b = &data[net->header->headerSize];
+    LlmHeader *h = net->header;
+
+    // --- 1. Embedding (通常不切分，或者只在 Root 保留) ---
+    b += loader->loadRoot("embedding", 0, net->tokenEmbeddingSize.nBytes, b);
+
+    // --- 2. 逐层加载 ---
+    for (NnUint layerIndex = 0u; layerIndex < h->nLayers; layerIndex++) {
+        
+        // -------------------------------------------------------------------
+        // Attention: Q, K, V (Row Parallel, 按 Head 切分)
+        // -------------------------------------------------------------------
+        b += loader->loadRowMatmulSlicesUneven("block_matmul_q", layerIndex, 0, 
+            [&](NnUint nodeIndex) { 
+                return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, nodeIndex); 
+            }, b);
+
+        b += loader->loadRowMatmulSlicesUneven("block_matmul_k", layerIndex, 0, 
+            [&](NnUint nodeIndex) { 
+                return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex); 
+            }, b);
+
+        b += loader->loadRowMatmulSlicesUneven("block_matmul_v", layerIndex, 0, 
+            [&](NnUint nodeIndex) { 
+                return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->kvHeadSplit, h->kvDim, nodeIndex); 
+            }, b);
+
+        // -------------------------------------------------------------------
+        // Attention: WO (Col Parallel, 按 Head 切分)
+        // -------------------------------------------------------------------
+        b += loader->loadColMatmulSlicesUneven("block_matmul_wo", layerIndex, 0, 
+            [&](NnUint nodeIndex) { 
+                return sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, plan, nodeIndex); 
+            }, b);
+
+
+        // -------------------------------------------------------------------
+        // FFN / MoE (按 FFN 维度切分)
+        // -------------------------------------------------------------------
+        // 确定 FFN 维度 (标准或 MoE)
+        NnUint ffDim = (h->archType == QWEN3_MOE) ? h->moeHiddenDim : h->hiddenDim;
+
+        if (h->nExperts > 0) {
+            // --- MoE 模式 ---
+            // Gate (不切分，所有节点都需要)
+            b += loader->loadAll("block_moe_gate", layerIndex, net->moeGateSize.nBytes, b);
+            
+            // Experts (W1, W2, W3) - 对每个专家进行切分
+            for (NnUint expertIndex = 0u; expertIndex < h->nExperts; expertIndex++) {
+                b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, expertIndex, 
+                    [&](NnUint nodeIndex) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex); }, b);
+                
+                b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, expertIndex, 
+                    [&](NnUint nodeIndex) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, nodeIndex); }, b);
+                
+                b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, expertIndex, 
+                    [&](NnUint nodeIndex) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex); }, b);
+            }
+        } else {
+            // --- 标准 FFN 模式 ---
+            b += loader->loadRowMatmulSlicesUneven("block_matmul_w1", layerIndex, 0, 
+                [&](NnUint nodeIndex) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex); }, b);
+            
+            b += loader->loadColMatmulSlicesUneven("block_matmul_w2", layerIndex, 0, 
+                [&](NnUint nodeIndex) { return sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, plan, nodeIndex); }, b);
+            
+            b += loader->loadRowMatmulSlicesUneven("block_matmul_w3", layerIndex, 0, 
+                [&](NnUint nodeIndex) { return sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, plan, nodeIndex); }, b);
+        }
+
+        // -------------------------------------------------------------------
+        // Norms (不切分，每个节点都需要完整副本)
+        // -------------------------------------------------------------------
+        if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+            b += loader->loadAll("block_norm_q", layerIndex, net->qkRmsNormSize.nBytes, b);
+            b += loader->loadAll("block_norm_k", layerIndex, net->qkRmsNormSize.nBytes, b);
+        }
+
+        b += loader->loadAll("block_norm_0", layerIndex, net->rmsNormSize.nBytes, b);
+        b += loader->loadAll("block_norm_1", layerIndex, net->rmsNormSize.nBytes, b);
+
+        if (timer.elapsedMiliseconds() > 10000)
+            printf("💿 Loaded %u/%u\n", layerIndex + 1, h->nLayers);
+            timer.reset();
+    }
+
+    // --- 3. Final Norm (不切分) ---
+    b += loader->loadAll("final_norm", 0u, net->rmsNormSize.nBytes, b);
+    
+    // --- 4. Logits / Output Head (Row Parallel, 按 Vocab 切分) ---
+    b += loader->loadRowMatmulSlicesUneven("final_matmul_logits", 0u, 0u, 
+        [&](NnUint nodeIndex) { 
+            return sliceRowMatmulLogitsUneven(h->weightType, h->dim, h->vocabSize, plan, nodeIndex); 
+        }, b);
+
+    // --- 5. 结束检查 ---
+    long long missingBytes = (long long)(b - data) - net->header->fileSize;
+    if (missingBytes != 0u)
+        throw std::runtime_error("Missing bytes in weight file: " + std::to_string(missingBytes));
+    
+    printf("💿 Weights loaded successfully (Uneven)\n");
 
     loader->finish();
 }

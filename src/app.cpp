@@ -272,9 +272,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         printf("Tokenizer vocab size (%d) does not match the model vocab size (%d)\n", tokenizer.vocabSize, header.vocabSize);
 
     Sampler sampler(tokenizer.vocabSize, args->temperature, args->topp, args->seed);
-
     LlmNet net;
     if(args->ratiosStr != nullptr){
+        printf("nNodes=%d\n", nNodes);
         std::vector<float> ratios = parseRatios(args->ratiosStr, nNodes);
         net = buildLlmNetUneven(&header, nNodes, args->nBatches, ratios);
         if (args->info) {
@@ -298,7 +298,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::unique_ptr<NnNodeSynchronizer> synchronizer(nullptr);
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
-
+    printf("nNodes=%d\n", nNodes);
     if (nNodes == 1) {
         synchronizer.reset(new NnFakeNodeSynchronizer());
     } else {
@@ -313,8 +313,31 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution);
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
 
-    NnRootWeightLoader weightLoader(&executor, network, nNodes);
-    loadLlmNetWeight(args->modelPath, &net, &weightLoader);
+    // Load weights
+    if (args->ratiosStr != nullptr) {
+        // [非均匀模式]：强制使用本地加载 (Local Loading)
+        // 摒弃网络传输，Root 节点直接从本地文件加载属于自己的部分。
+        printf("🚀 Local Loading Mode (Root): Loading weights locally...\n");
+        
+        NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
+        
+        std::vector<float> ratios = parseRatios(args->ratiosStr, nNodes);
+        NnUnevenPartitionPlan plan = createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim);
+        
+        // 创建本地加载器 (指定 Root 的 index 为 0)
+        NnLocalWeightLoader localLoader(&executor, 0); 
+        
+        // 调用非均匀加载函数 (传入 Plan 和 LocalLoader)
+        loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, &plan);
+        
+        // 释放临时蓝图
+        releasePartitionPlan(&plan);
+    } else {
+        // [均匀模式]：保持原有行为 (使用 NnRootWeightLoader)
+        // 这里的 NnRootWeightLoader 可能会通过网络将权重分发给 Worker
+        NnRootWeightLoader weightLoader(&executor, network, nNodes);
+        loadLlmNetWeight(args->modelPath, &net, &weightLoader);
+    }
 
     RootLlmInference inference(&net, &execution, &executor, network);
 

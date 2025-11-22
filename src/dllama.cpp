@@ -2,6 +2,7 @@
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-cpu-ops.hpp"
+#include "nn/nn-network-local.hpp"
 #include "nn/nn-network.hpp"
 #include "nn/nn-executor.hpp"
 #include "llm.hpp"
@@ -266,6 +267,7 @@ int main(int argc, char **argv) {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
         if (std::strcmp(args.mode, "inference") == 0) {
             args.benchmark = true;
+            printf("nNodes=%d\n", args.nWorkers);
             runInferenceApp(&args, &inference);
         } else if (std::strcmp(args.mode, "perplexity") == 0)
             runInferenceApp(&args, &perplexity);

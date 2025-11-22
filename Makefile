@@ -51,6 +51,8 @@ nn-executor.o: src/nn/nn-executor.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
 nn-network.o: src/nn/nn-network.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
+nn-network-local.o: src/nn/nn-network-local.cpp
+	$(CXX) $(CXXFLAGS) -c $^ -o $@
 llamafile-sgemm.o: src/nn/llamafile/sgemm.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
 nn-cpu-ops.o: src/nn/nn-cpu-ops.cpp
@@ -63,6 +65,7 @@ nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o 
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 nn-vulkan.o: src/nn/nn-vulkan.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
+
 
 ifdef DLLAMA_VULKAN
 VULKAN_SHADER_SRCS := $(wildcard src/nn/vulkan/*.comp)
@@ -88,7 +91,7 @@ tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o n
 uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o 
 # [TAB] <-- 这一行必须以 TAB 开始！
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
-dllama: src/dllama.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
+dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)

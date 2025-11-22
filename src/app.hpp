@@ -4,6 +4,9 @@
 #include <chrono>
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu.hpp"
+#include "nn/nn-network.hpp"
+#include "nn/nn-executor.hpp"
+#include "nn/nn-network-local.hpp"
 #include "tokenizer.hpp"
 #include "llm.hpp"
 

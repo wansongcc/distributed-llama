@@ -41,10 +41,11 @@
         "--buffer-float-type", "q80",
         "--nthreads", "2",
         "--max-seq-len", "2048",
-        "--workers", "rpi-trixie-JSAC3:9999"
+        "--workers", "rpi-trixie2:10086",
+        "--ratios", "1.0,2.0"
       ],
       "cwd": "/workspace/distributed-llama",
-      "stopAtEntry": false,
+      "stopAtEntry": true,
       "externalConsole": false,
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb",
@@ -67,6 +68,28 @@
     ],
     "cwd": "/workspace/distributed-llama",
     "stopAtEntry": false,
+    "externalConsole": false,
+    "MIMode": "gdb",
+    "miDebuggerPath": "/usr/bin/gdb",
+    "environment": [
+        { "name": "ASAN_OPTIONS", "value": "abort_on_error=1:fast_unwind_on_malloc=0:detect_leaks=1" }
+    ],
+    "setupCommands": [
+        { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "description": "Set disassembly flavor to intel", "text": "-gdb-set disassembly-flavor intel", "ignoreFailures": true }
+    ]
+  },
+    {
+    "name": "dllama worker (ASan)",
+    "type": "cppdbg",
+    "request": "launch",
+    "program": "/workspace/distributed-llama/dllama",
+    "args": [
+        "worker",
+        "--port", "10086"
+    ],
+    "cwd": "/workspace/distributed-llama",
+    "stopAtEntry": true,
     "externalConsole": false,
     "MIMode": "gdb",
     "miDebuggerPath": "/usr/bin/gdb",

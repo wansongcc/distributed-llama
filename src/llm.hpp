@@ -3,7 +3,8 @@
 
 #include "nn/nn-core.hpp"
 #include "nn/nn-executor.hpp"
-#include "nn/nn-network.hpp"
+#include "nn/nn-network-local.hpp"
+
 
 enum LlmHeaderKey {
     VERSION = 0,
@@ -142,5 +143,6 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
 LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std::vector<float>& ratios);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
+void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan);
 
 #endif
