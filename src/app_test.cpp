@@ -1,4 +1,7 @@
 #include "app.hpp"
+#include "llm.hpp" // 包含 loadLlmNetWeightUneven, buildLlmNetUneven 等声明
+#include "nn/nn-network.hpp"
+#include "nn/nn-network-local.hpp" // [新增] 本地加载器
 #include <cassert>
 #include <cstring>
 #include <sstream>
@@ -6,9 +9,12 @@
 #include <cmath>
 #include <vector>
 #include <stdexcept>
+
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
+
+// --- 辅助函数 ---
 
 static NnFloatType parseFloatType(char *val) {
     if (std::strcmp(val, "f32") == 0) return F_32;
@@ -24,6 +30,33 @@ static ChatTemplateType parseChatTemplateType(char *val) {
     if (std::strcmp(val, "deepSeek3") == 0) return TEMPLATE_DEEP_SEEK3;
     throw std::runtime_error("Invalid chat template type: " + std::string(val));
 }
+
+// [新增] 解析逗号分隔的比例字符串
+static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
+    if (ratiosStr == nullptr) {
+        throw std::invalid_argument("Ratios string cannot be empty");
+    }
+    std::vector<float> ratios;
+    std::string s(ratiosStr);
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) {
+            try {
+                ratios.push_back(std::stof(item));
+            } catch (...) {
+                throw std::invalid_argument(std::string("Invalid ratio value: ") + item);
+            }
+        }
+    }
+    if (ratios.size() != nNodes) {
+        throw std::invalid_argument("Number of ratios (" + std::to_string(ratios.size()) + 
+                                  ") must match number of nodes (" + std::to_string(nNodes) + ")");
+    }
+    return ratios;
+}
+
+// --- AppCliArgs 实现 ---
 
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
@@ -57,7 +90,6 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         args.mode = argv[1];
         i++;
     }
-    // First see if any of the args are asking for help/usage and fail fast
     for (int x = 0; x < argc; x++) {
         if ((std::strcmp(argv[x], "--usage") == 0) ||
             (std::strcmp(argv[x], "--help") == 0) ||
@@ -98,11 +130,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.workerHosts[s][hostLen] = '\0';
                 args.workerPorts[s] = std::atoi(separator + 1);
             }
-
             i += count - 1;
-        } else if (strcmp(argv[i], "--ratios") == 0) {
-            if (++i >= argc) throw std::runtime_error("--ratios requires an argument (e.g., \"1.0,3.0\")");
-            args.ratiosStr = argv[i];
+        } else if (std::strcmp(name, "--ratios") == 0) {
+            // 修复之前的 bug：不使用 ++i，直接使用 value
+            args.ratiosStr = value;
         } else if (std::strcmp(name, "--port") == 0) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
@@ -149,29 +180,7 @@ AppCliArgs::~AppCliArgs() {
         delete[] workerPorts;
 }
 
-static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
-    if (ratiosStr == nullptr) {
-        throw std::invalid_argument("Ratios 字符串不能为空");
-    }
-    std::vector<float> ratios;
-    std::string s(ratiosStr);
-    std::stringstream ss(s);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        try {
-            ratios.push_back(std::stof(item));
-        } catch (const std::exception& e) {
-            throw std::invalid_argument(std::string("无效的比例值: ") + item);
-        }
-    }
-    if (ratios.size() != nNodes) {
-        throw std::invalid_argument(
-            std::string("Ratios 数量 (") + std::to_string(ratios.size()) + 
-            std::string(") 必须等于节点总数 (nNodes = ") + std::to_string(nNodes) + ")"
-        );
-    }
-    return ratios;
-}
+// --- Device Resolution ---
 
 static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
     std::vector<NnExecutorDevice> devices;
@@ -189,10 +198,13 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     }
 
     if (args->gpuIndex < 0 || (args->gpuSegmentFrom >= 0 && args->gpuSegmentTo >= 0)) {
+        // 传入 plan 以支持非均匀切分时的稳定性检查和指针计算
         devices.push_back(NnExecutorDevice(new NnCpuDevice(netConfig, nodeConfig, netExecution, plan), -1, -1));
     }
     return devices;
 }
+
+// --- Inference Implementations (Root & Worker) ---
 
 RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network) {
     this->header = net->header;
@@ -201,7 +213,7 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->logitsPipe = (float *)execution->pipes[net->logitsPipeIndex];
     this->execution = execution;
     this->executor = executor;
-    this->network = network; // May be nullptr!
+    this->network = network; 
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -258,8 +270,11 @@ bool WorkerLlmInference::tryReadControlPacket() {
     return true;
 }
 
+// --- Main Application Entry Points ---
+
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
+
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
     if (nNodes > header.nKvHeads)
         // TODO: https://github.com/b4rtaz/distributed-llama/issues/70
@@ -272,27 +287,25 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         printf("Tokenizer vocab size (%d) does not match the model vocab size (%d)\n", tokenizer.vocabSize, header.vocabSize);
 
     Sampler sampler(tokenizer.vocabSize, args->temperature, args->topp, args->seed);
-    LlmNet net;
-    std::unique_ptr<NnUnevenPartitionPlan> planPtr;
-    std::vector<float> ratios;
 
-    if(args->ratiosStr != nullptr){
-        printf("nNodes=%d\n", nNodes);
+    // --- 1. Build Network ---
+    LlmNet net;
+    std::vector<float> ratios;
+    // 用于保存 plan 指针，以便传递给 resolveDevices
+    std::unique_ptr<NnUnevenPartitionPlan> planPtr; 
+
+    if (args->ratiosStr != nullptr) {
+        // [非均匀模式]
+        printf("🚀 Mode: Uneven Partitioning (%s)\n", args->ratiosStr);
         ratios = parseRatios(args->ratiosStr, nNodes);
-        NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
-        planPtr.reset(new NnUnevenPartitionPlan(
-            createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim)
-        ));
         net = buildLlmNetUneven(&header, nNodes, args->nBatches, ratios);
-        if (args->info) {
-            printf("⚖️  Uneven partitioning strategy enabled: %s\n", args->ratiosStr);
-        }
-    }else{
-        printf("⚖️  Even partitioning strategy enabled: ");
+    } else {
+        // [均匀模式]
+        printf("🚀 Mode: Uniform Partitioning\n");
         net = buildLlmNet(&header, nNodes, args->nBatches);
     }
-    std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
+    std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
 
     if (args->info) {
@@ -302,7 +315,6 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     }
 
     NnNetExecution execution(args->nThreads, &net.netConfig);
-
     std::unique_ptr<NnNodeSynchronizer> synchronizer(nullptr);
     std::unique_ptr<NnNetwork> networkPtr(nullptr);
     NnNetwork *network = nullptr;
@@ -312,37 +324,42 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     } else {
         networkPtr = NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts);
         network = networkPtr.get();
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get()));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
     }
 
-    // initialize uneven partition plan if needed
-
-
+    // --- 2. Initialize Executor ---
+    // 如果是非均匀模式，我们需要创建 Plan 并传递给 resolveDevices
+    if (args->ratiosStr != nullptr) {
+        NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
+        planPtr.reset(new NnUnevenPartitionPlan(
+            createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim)
+        ));
+    }
+    
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
 
-    // Load weights
+    // --- 3. Load Weights ---
     if (args->ratiosStr != nullptr) {
-        // [非均匀模式]：强制使用本地加载 (Local Loading)
-        // 摒弃网络传输，Root 节点直接从本地文件加载属于自己的部分。
+        // [非均匀 + 本地加载]
         printf("🚀 Local Loading Mode (Root): Loading weights locally...\n");
-        // 创建本地加载器 (指定 Root 的 index为 0)
+        
+        // 创建本地加载器 (Node 0)
         NnLocalWeightLoader localLoader(&executor, 0); 
         
-        // 调用非均匀加载函数 (传入 Plan 和 LocalLoader)
+        // 加载
         loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, planPtr.get());
-        printf("✅ Root: Weights loaded locally.\n");
-
+        
     } else {
-        // [均匀模式]：保持原有行为 (使用 NnRootWeightLoader)
-        // 这里的 NnRootWeightLoader 可能会通过网络将权重分发给 Worker
+        // [均匀 + 网络分发] (Legacy)
         NnRootWeightLoader weightLoader(&executor, network, nNodes);
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
+    // --- 4. Inference ---
     RootLlmInference inference(&net, &execution, &executor, network);
 
     if (network != nullptr) {
@@ -365,6 +382,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     handler(&context);
 
     inference.finish();
+    
+    // Plan 由 unique_ptr 自动释放
 }
 
 void runWorkerApp(AppCliArgs *args) {
@@ -381,7 +400,8 @@ void runWorkerApp(AppCliArgs *args) {
         printNodeRequiredMemory(&netConfig, &nodeConfig);
 
         NnNetExecution execution(args->nThreads, &netConfig);
-
+        
+        // 准备 Plan (如果是本地加载模式) 用于 resolveDevices
         std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
              LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
@@ -393,11 +413,11 @@ void runWorkerApp(AppCliArgs *args) {
              ));
         }
 
-
-        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
+        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig);
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
 
+        // --- Weight Loading Logic ---
         if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
             // [本地加载]
             printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, args->modelPath);
@@ -464,5 +484,7 @@ void runWorkerApp(AppCliArgs *args) {
                 break;
             }
         }
+        
+        // Plan 由 unique_ptr 自动释放
     }
 }

@@ -41,8 +41,8 @@
         "--buffer-float-type", "q80",
         "--nthreads", "2",
         "--max-seq-len", "2048",
-        "--workers", "rpi-trixie2:10086",
-        "--ratios", "1.0,2.0"
+        "--workers", "rpi-trixie2:10001",
+        "--ratios", "1.0,3.0"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,

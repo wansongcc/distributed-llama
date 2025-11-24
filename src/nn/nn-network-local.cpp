@@ -60,7 +60,7 @@ NnSize NnLocalWeightLoader::loadRowMatmulSlicesUneven(const char *opName, const 
     // 4. 加载
     executor->loadWeight(opName, opIndex, offset, slice.sliceSize.nBytes, temp);
 
-    return slice.sliceSize.nBytes;
+    return slice.size.nBytes;
 }
 
 NnSize NnLocalWeightLoader::loadColMatmulSlicesUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex, 
@@ -78,5 +78,5 @@ NnSize NnLocalWeightLoader::loadColMatmulSlicesUneven(const char *opName, const 
     // 4. 加载
     executor->loadWeight(opName, opIndex, offset, slice.sliceSize.nBytes, temp);
 
-    return slice.sliceSize.nBytes;
+    return slice.size.nBytes;
 }

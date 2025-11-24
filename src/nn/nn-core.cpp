@@ -385,6 +385,7 @@ NnUnevenPartitionPlan createPartitionPlan(
         throw std::invalid_argument("nNodes must be greater than 0");
     }
     if (nNodes != ratios.size()) {
+        printf("🚨 CRITICAL ERROR in createPartitionPlan: nNodes=%u, ratios.size()=%zu\n", nNodes, ratios.size());
         throw std::invalid_argument("nNodes must match ratios.size()");
     }
 

@@ -2,6 +2,7 @@
 #define NN_NETWORK_H
 
 #include "nn-executor.hpp"
+#include "nn-core.hpp"
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -75,8 +76,9 @@ private:
     NnNetExecution *execution;
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
+    const NnUnevenPartitionPlan *plan;
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
     ~NnNetworkNodeSynchronizer() override {};
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
 };

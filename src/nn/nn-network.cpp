@@ -11,6 +11,7 @@ typedef SSIZE_T ssize_t;
 #include <netdb.h>  // for getaddrinfo
 #endif
 #include "nn-network.hpp"
+#include "nn-core.hpp"
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
@@ -29,6 +30,13 @@ static inline bool isEagainError() {
     #else
     return SOCKET_LAST_ERRCODE == EAGAIN;
     #endif
+}
+
+static NnUint getSplitTotal(const NnDimSplit& split, NnUint nNodes) {
+    if (!split.lengths) return 0;
+    NnUint sum = 0;
+    for(NnUint i=0; i<nNodes; ++i) sum += split.lengths[i];
+    return sum;
 }
 
 static inline void setNonBlocking(int socket, bool enabled) {
@@ -79,6 +87,84 @@ void setReuseAddr(int socket) {
         throw std::runtime_error("setsockopt failed: " + std::string(strerror(errno)));
     }
     #endif
+}
+
+static NnUint getUnevenSliceSize(const NnUnevenPartitionPlan *plan, NnUint totalSize, NnUint nodeIndex) {
+    if (!plan) return totalSize / plan->nNodes; // Fallback
+
+    // 尝试匹配 Vocab
+    NnUint vocabTotal = getSplitTotal(plan->vocabSplit, plan->nNodes);
+    if (vocabTotal > 0 && totalSize % vocabTotal == 0) {
+        return plan->vocabSplit.lengths[nodeIndex] * (totalSize / vocabTotal);
+    }
+    // 尝试匹配 FFN
+    NnUint ffnTotal = getSplitTotal(plan->ffnSplit, plan->nNodes);
+    if (ffnTotal > 0 && totalSize % ffnTotal == 0) {
+        return plan->ffnSplit.lengths[nodeIndex] * (totalSize / ffnTotal);
+    }
+    // 尝试匹配 Heads
+    NnUint headTotal = getSplitTotal(plan->headSplit, plan->nNodes);
+    if (headTotal > 0 && totalSize % headTotal == 0) {
+        return plan->headSplit.lengths[nodeIndex] * (totalSize / headTotal);
+    }
+    
+    // 默认均匀
+    return totalSize / plan->nNodes;
+}
+
+static NnUint getUnevenSliceOffset(const NnUnevenPartitionPlan *plan, NnUint totalSize, NnUint nodeIndex) {
+    if (!plan) return (totalSize / plan->nNodes) * nodeIndex;
+
+    // (同上逻辑，使用 starts 而不是 lengths)
+    NnUint vocabTotal = getSplitTotal(plan->vocabSplit, plan->nNodes);
+    if (vocabTotal > 0 && totalSize % vocabTotal == 0) {
+        return plan->vocabSplit.starts[nodeIndex] * (totalSize / vocabTotal);
+    }
+    // ... FFN, Heads ...
+    
+    return (totalSize / plan->nNodes) * nodeIndex;
+}
+
+static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, NnSize totalBytes, 
+                             std::vector<NnSize>& offsets, std::vector<NnSize>& sizes) {
+    bool matchFound = false;
+
+    if (plan && plan->nNodes == nNodes) {
+        // Lambda: 尝试匹配某个 Split 方案
+        // 如果 Split的总份数 能整除 totalBytes，说明当前 Buffer 就是按这个方案切分的
+        auto tryMatch = [&](const NnDimSplit& split) -> bool {
+            NnUint totalUnits = getSplitTotal(split, nNodes);
+            if (totalUnits > 0 && totalBytes % totalUnits == 0) {
+                NnSize bytesPerUnit = totalBytes / totalUnits;
+                // 填充 Offsets 和 Sizes
+                for (NnUint i = 0; i < nNodes; ++i) {
+                    offsets[i] = split.starts[i] * bytesPerUnit;
+                    sizes[i]   = split.lengths[i] * bytesPerUnit;
+                }
+                return true;
+            }
+            return false;
+        };
+
+        // 按优先级尝试匹配 (Vocab > FFN > Heads > KV)
+        // Logits (Vocab) 通常最大，最容易区分
+        if (!matchFound) matchFound = tryMatch(plan->vocabSplit);
+        if (!matchFound) matchFound = tryMatch(plan->ffnSplit);
+        if (!matchFound) matchFound = tryMatch(plan->headSplit);
+        if (!matchFound) matchFound = tryMatch(plan->kvHeadSplit);
+    }
+
+    // Fallback: 如果没有 Plan 或者没有匹配的 Split，使用均匀切分
+    if (!matchFound) {
+        NnSize avgBytes = totalBytes / nNodes;
+        for (NnUint i = 0; i < nNodes; ++i) {
+            sizes[i] = avgBytes;
+            offsets[i] = i * avgBytes;
+        }
+        // 修正最后一个节点以处理余数 (虽然 totalBytes 应该对齐，但防万一)
+        offsets[nNodes - 1] = (nNodes - 1) * avgBytes;
+        sizes[nNodes - 1] = totalBytes - offsets[nNodes - 1];
+    }
 }
 
 void writeSocket(int socket, const void *data, NnSize size) {
@@ -562,45 +648,68 @@ static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, N
     }
 }
 
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex, const NnUnevenPartitionPlan *plan) {
     bool isWorker = nodeIndex != 0;
     NnUint nSockets = onlyFromWorkerToRoot && isWorker ? 1 : network->nSockets;
+    
+    // 计算当前线程负责的 Socket 数量
     NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
     if (nSocketsPerThread == 0) return;
-    NnSize sliceBytes = nBytes / nNodes;
+
+    // [关键] 1. 计算所有节点的 Slice 信息
+    // sliceOffsets[i] 表示节点 i 的数据在 buffer 中的起始字节
+    // sliceSizes[i]   表示节点 i 的数据长度
+    std::vector<NnSize> sliceOffsets(nNodes);
+    std::vector<NnSize> sliceSizes(nNodes);
+    fillUnevenSlices(plan, nNodes, nBytes, sliceOffsets, sliceSizes);
 
     std::vector<NnSocketIo> ios(nSocketsPerThread);
 
+    // [关键] 2. 发送阶段 (Send)
+    // 如果我是发送者 (Root 总是发送; Worker 在 !onlyFromWorkerToRoot 时发送)
     if (!onlyFromWorkerToRoot || isWorker) {
-        NnByte *mySliceData = &buffer[sliceBytes * nodeIndex];
+        // 获取 **我自己 (nodeIndex)** 负责的那部分数据
+        NnByte *mySliceData = &buffer[sliceOffsets[nodeIndex]];
+        NnSize mySliceSize = sliceSizes[nodeIndex];
 
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             NnUint socketIndex = threadIndex + i * nThreads;
             ios[i].socketIndex = socketIndex;
             ios[i].data = mySliceData;
-            ios[i].size = sliceBytes;
+            ios[i].size = mySliceSize; // 发送我的非均匀大小
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
     }
 
+    // [关键] 3. 接收阶段 (Receive)
+    // 如果我是接收者 (Root 总是接收; Worker 在 !onlyFromWorkerToRoot 时接收)
     if (!onlyFromWorkerToRoot || !isWorker) {
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             NnUint socketIndex = threadIndex + i * nThreads;
-            NnUint sliceIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
-            NnByte *sliceData = &buffer[sliceBytes * sliceIndex];
+            
+            // 计算 Socket 对应的 目标节点 ID
+            // (Root 的 socket 0 连 Node 1, socket 1 连 Node 2...)
+            // (Worker 的 socket 0 连 Root(Node 0), socket 1 连 Node 2...)
+            NnUint targetNodeIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
+
+            // 使用 **目标节点 (targetNodeIndex)** 的 Offset 和 Size
+            NnByte *targetSliceData = &buffer[sliceOffsets[targetNodeIndex]];
+            NnSize targetSliceSize = sliceSizes[targetNodeIndex];
+
             ios[i].socketIndex = socketIndex;
-            ios[i].data = sliceData;
-            ios[i].size = sliceBytes;
+            ios[i].data = targetSliceData;
+            ios[i].size = targetSliceSize; // 接收目标的非均匀大小
         }
         network->readMany(nSocketsPerThread, &ios[0]);
     }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
+    this->plan = plan;
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -618,9 +727,9 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan);
             } else {
                 throw std::invalid_argument("Unknown sync type");
             }
