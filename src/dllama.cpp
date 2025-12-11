@@ -78,7 +78,6 @@ static void inference(AppInferenceContext *context) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         context->inference->forward();
-
         token = context->sampler->sample(context->inference->logitsPipe);
 
         char *piece = context->tokenizer->decode(token);

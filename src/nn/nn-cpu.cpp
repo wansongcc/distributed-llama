@@ -250,6 +250,7 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
                 // 按优先级尝试匹配 (Vocab > FFN > Heads)
                 if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit);
                 if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit);
+                if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit);
                 if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit);
                 if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit);
             }

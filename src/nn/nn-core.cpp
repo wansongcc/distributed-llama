@@ -379,7 +379,8 @@ NnUnevenPartitionPlan createPartitionPlan(
     NnUint globalNHeads,
     NnUint globalNKvHeads,
     NnUint globalVocabSize,
-    NnUint globalFfnDim
+    NnUint globalFfnDim,
+    NnUint globalDim
 ) {
     if (nNodes == 0) {
         throw std::invalid_argument("nNodes must be greater than 0");
@@ -388,6 +389,11 @@ NnUnevenPartitionPlan createPartitionPlan(
         printf("🚨 CRITICAL ERROR in createPartitionPlan: nNodes=%u, ratios.size()=%zu\n", nNodes, ratios.size());
         throw std::invalid_argument("nNodes must match ratios.size()");
     }
+    
+    if (globalNHeads % globalNKvHeads != 0) {
+        throw std::runtime_error("nHeads must be divisible by nKvHeads for GQA alignment");
+    }
+    NnUint gqaGroupSize = globalNHeads / globalNKvHeads;
 
     NnUnevenPartitionPlan plan;
     plan.nNodes = nNodes;
@@ -397,10 +403,30 @@ NnUnevenPartitionPlan createPartitionPlan(
     plan.vocabSplit = {nullptr, nullptr};
     plan.ffnSplit = {nullptr, nullptr};
     try {
-        plan.headSplit = createDimSplit(globalNHeads, ratios);
+// -------------------------------------------------------------------
+        // 2. 核心修复：基于 GQA 对齐的切分
+        // 先切分 KV Heads (数量较少，必须是整数)
+        // -------------------------------------------------------------------
         plan.kvHeadSplit = createDimSplit(globalNKvHeads, ratios);
+
+        // 基于 KV 的切分结果，强制推导 Q Heads 的切分
+        // 确保 Q Head 数量严格等于 KV Head 数量 * Group Size
+        plan.headSplit.starts = new NnUint[nNodes];
+        plan.headSplit.lengths = new NnUint[nNodes];
+
+        for (NnUint i = 0; i < nNodes; i++) {
+            // Q Starts = KV Starts * Group Size
+            plan.headSplit.starts[i] = plan.kvHeadSplit.starts[i] * gqaGroupSize;
+            // Q Lengths = KV Lengths * Group Size
+            plan.headSplit.lengths[i] = plan.kvHeadSplit.lengths[i] * gqaGroupSize;
+        }
+
+        // -------------------------------------------------------------------
+        // 3. 其他维度的切分保持不变
+        // -------------------------------------------------------------------
         plan.vocabSplit = createDimSplit(globalVocabSize, ratios);
         plan.ffnSplit = createDimSplit(globalFfnDim, ratios);
+        plan.dimSplit = createDimSplit(globalDim, ratios);
     } catch (const std::exception& e) {
         // --- 5. 清理 ---
         // 如果 kvHeadSplit 创建失败, 需确保已分配的 headSplit 被释放
@@ -576,6 +602,7 @@ NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen,
                                   NnUint globalKvDim, NnUint globalNKvHeads, NnUint headDim, float ropeTheta,
                                   const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
     NnRopeSliceUneven s;
+    std::memset(&s, 0, sizeof(s));
 
     // --- 1. Q 侧 (来自 headSplit) ---
     const NnUint qHeadStart = plan->headSplit.starts[nodeIndex];
@@ -616,31 +643,27 @@ NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen,
 NnUint splitRowMatmulWeightUneven(NnRowMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0) {
     NnSize blockSize = getBlockSize(slice->type);
     NnSize batchBytes = getBytes(slice->type, blockSize);
-    assert(slice->n % blockSize == 0); // 'n' 是全局输入维度
+    
+    // 校验对齐
+    assert(slice->n % blockSize == 0); // n 是完整输入维度 (Width)
 
-    // 1. 计算一个完整“列”中的块数
-    NnSize n_blocks_per_column = slice->n / blockSize;
-    
-    // 2. 计算一个完整“列”的字节大小
-    NnSize column_bytes = n_blocks_per_column * batchBytes;
+    // 1. 计算“一行”的字节数 (Global Stride)
+    NnSize bytes_per_row = (slice->n / blockSize) * batchBytes;
 
-    // 3. (关键) 计算源 (weight) 的起始偏移量
-    // 偏移量 = 起始列索引 * 单个列的字节大小
-    NnSize offset = slice->inStart * column_bytes;
-    
-    NnSize copiedBytes = 0;
-    
-    // 4. 循环复制本节点负责的 'inLen' (或 d0) 个列
-    for (NnUint d = 0; d < slice->inLen; d++) {
-        for (NnUint j = 0; j < n_blocks_per_column; j++) {
-            // o = 目标缓冲区(weight0)中的局部偏移量
-            NnSize o = (d * n_blocks_per_column + j) * batchBytes; 
-            // offset + o = 源缓冲区(weight)中的全局偏移量
-            std::memcpy(weight0 + o, weight + offset + o, batchBytes);
-            copiedBytes += batchBytes;
-        }
-    }
-    return copiedBytes;
+    // 2. 计算源 (weight) 的起始字节偏移
+    // inStart: 起始行号
+    NnSize offset = slice->inStart * bytes_per_row;
+
+    // 3. 计算本节点需要复制的总字节数
+    // inLen: 本节点负责的行数
+    NnSize total_copy_bytes = slice->inLen * bytes_per_row;
+
+    // 4. 单次内存拷贝 (极快)
+    // 注意：如果是 NnLocalWeightLoader 的 Zero-Copy 优化，这一步甚至都不需要
+    // 但作为通用工具函数，这里应该是 memcpy
+    std::memcpy(weight0, weight + offset, total_copy_bytes);
+
+    return total_copy_bytes;
 }
 
 NnUint splitColMatmulWeightUneven(NnColMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0) {

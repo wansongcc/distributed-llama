@@ -622,8 +622,10 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std
         h->nHeads,
         h->nKvHeads,
         h->vocabSize,
-        ffDim
+        ffDim,
+        h->dim
     );    
+    printf("\n🔍 [DEBUG] Partition Plan for Node %d:\n", nNodes);
     n.tokenEmbeddingSize = size2D(F_32, h->vocabSize, h->dim);
     n.rmsNormSize = size1D(F_32, h->dim);
     n.qkRmsNormSize = size1D(F_32, h->headDim);
@@ -650,6 +652,13 @@ LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std
         NnRowMatmulSliceUneven kSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan.kvHeadSplit, h->kvDim, nodeIndex);
         NnRowMatmulSliceUneven vSlice = sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan.kvHeadSplit, h->kvDim, nodeIndex);
         NnColMatmulSliceUneven woSlice = sliceColMatmulAttUneven(h->weightType, h->qDim, h->dim, h->headDim, &plan, nodeIndex);
+        // [DEBUG CODE START] ---------------------------------------
+        printf("  👉 Node %d:\n", nodeIndex);
+        printf("     Q_Slice:  inLen=%d (Expected: %d)\n", qSlice.inLen, (nodeIndex==0? 256 : 768) * 2); // QDim=2048. Node0=1/4=512, Node1=3/4=1536 (假设是Q40 block size) 
+        // 注意：Q40/F32 的 inLen 定义可能不同，F32下 inLen 就是 float 数量
+        printf("     KV_Slice: inLen=%d\n", kSlice.inLen);
+        printf("     KV_Cache: kvLen=%d\n", kvCacheSlice.kvLen);
+        // [DEBUG CODE END] -----------------------------------------
 
         NnRowMatmulSliceUneven w1Slice = sliceRowMatmulFfnUneven(h->weightType, h->dim, ffDim, &plan, nodeIndex);
         NnColMatmulSliceUneven w2Slice = sliceColMatmulFfnUneven(h->weightType, ffDim, h->dim, &plan, nodeIndex);
@@ -908,7 +917,6 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     std::unique_ptr<MmapFile, void(*)(MmapFile *)> fdPtr(&file, closeMmapFile);
     printf("💿 Loading weights...\n");
 #endif
-
     Timer timer;
     NnByte *data = (NnByte *)file.data;
     NnByte *b = &data[net->header->headerSize];
@@ -967,9 +975,14 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
 
 
     Timer timer;
+    
     NnByte *data = (NnByte *)file.data;
     NnByte *b = &data[net->header->headerSize];
     LlmHeader *h = net->header;
+    NnByte *startPtr = b; // 记录起始位置
+
+    // [DEBUG]
+    printf("DEBUG: Start Ptr: %p\n", b);
 
     // --- 1. Embedding (通常不切分，或者只在 Root 保留) ---
     b += loader->loadRoot("embedding", 0, net->tokenEmbeddingSize.nBytes, b);
@@ -980,6 +993,9 @@ void loadLlmNetWeightUneven(const char *path, LlmNet *net, NnLocalWeightLoader *
         // -------------------------------------------------------------------
         // Attention: Q, K, V (Row Parallel, 按 Head 切分)
         // -------------------------------------------------------------------
+        if (layerIndex == 0) {
+             printf("DEBUG: Layer 0 Q Offset from body start: %ld bytes\n", b - startPtr);
+        }
         b += loader->loadRowMatmulSlicesUneven("block_matmul_q", layerIndex, 0, 
             [&](NnUint nodeIndex) { 
                 return sliceRowMatmulAttUneven(h->weightType, h->dim, h->headDim, &plan->headSplit, h->qDim, nodeIndex); 

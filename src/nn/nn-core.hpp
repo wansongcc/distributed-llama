@@ -5,10 +5,14 @@
 #include <list>
 #include <memory>
 #include <cstdint>
-#include "nn-quants.hpp"
 #include <vector>
+#include <cstring> // for std::memset
+#include <utility> // for std::move
+#include "nn-quants.hpp"
 
-// primitives
+// ======================================================================================
+// Primitives
+// ======================================================================================
 
 typedef struct {
     NnFloatType floatType;
@@ -21,11 +25,79 @@ typedef struct {
 } NnSize3D;
 
 typedef struct {
-    NnUint* starts;     //start positions
-    NnUint* lengths;    //lengths
+    NnUint* starts;    // start positions
+    NnUint* lengths;   // lengths
 } NnDimSplit;
 
-// slices
+// ======================================================================================
+// Uneven Partition Plan (Memory Safe)
+// ======================================================================================
+
+struct NnUnevenPartitionPlan {
+    NnUint nNodes;
+
+    NnDimSplit headSplit;
+    NnDimSplit kvHeadSplit;
+    NnDimSplit vocabSplit;
+    NnDimSplit ffnSplit;
+    NnDimSplit dimSplit;
+
+    // 默认构造函数
+    NnUnevenPartitionPlan() : nNodes(0) {
+        std::memset(&headSplit, 0, sizeof(headSplit));
+        std::memset(&kvHeadSplit, 0, sizeof(kvHeadSplit));
+        std::memset(&vocabSplit, 0, sizeof(vocabSplit));
+        std::memset(&ffnSplit, 0, sizeof(ffnSplit));
+        std::memset(&dimSplit, 0, sizeof(dimSplit));
+    }
+
+    // 析构函数：释放内部数组
+    ~NnUnevenPartitionPlan() {
+        freeSplit(headSplit);
+        freeSplit(kvHeadSplit);
+        freeSplit(vocabSplit);
+        freeSplit(ffnSplit);
+        freeSplit(dimSplit);
+    }
+
+    // 移动构造函数：用于 std::move 和 unique_ptr
+    NnUnevenPartitionPlan(NnUnevenPartitionPlan&& other) noexcept 
+        : nNodes(other.nNodes),
+          headSplit(other.headSplit),
+          kvHeadSplit(other.kvHeadSplit),
+          vocabSplit(other.vocabSplit),
+          ffnSplit(other.ffnSplit),
+          dimSplit(other.dimSplit) {
+        
+        // 剥夺源对象的所有权
+        zeroSplit(other.headSplit);
+        zeroSplit(other.kvHeadSplit);
+        zeroSplit(other.vocabSplit);
+        zeroSplit(other.ffnSplit);
+        zeroSplit(other.dimSplit);
+        other.nNodes = 0;
+    }
+
+    // 禁用拷贝 (防止 Double Free)
+    NnUnevenPartitionPlan(const NnUnevenPartitionPlan&) = delete;
+    NnUnevenPartitionPlan& operator=(const NnUnevenPartitionPlan&) = delete;
+
+private:
+    void freeSplit(NnDimSplit& split) {
+        if (split.starts) { delete[] split.starts; split.starts = nullptr; }
+        if (split.lengths) { delete[] split.lengths; split.lengths = nullptr; }
+    }
+    void zeroSplit(NnDimSplit& split) {
+        split.starts = nullptr;
+        split.lengths = nullptr;
+    }
+};
+
+// ======================================================================================
+// Slices (Original & Uneven)
+// ======================================================================================
+
+// --- Original Slices ---
 
 typedef struct {
     NnUint kvDim0;
@@ -74,101 +146,67 @@ typedef struct {
     NnSize3D attSize;
 } NnMultiHeadAttSlice;
 
-//Uneven slice
-typedef struct {
-    NnUint nNodes;
-
-    NnDimSplit headSplit;
-    NnDimSplit kvHeadSplit;
-    NnDimSplit vocabSplit;
-    NnDimSplit ffnSplit;
-    
-} NnUnevenPartitionPlan;
+// --- Uneven Slices ---
 
 typedef struct {
-
-    NnUint kvStart;   // 在 kv 维上的起点（本节点）
-    NnUint kvLen;     // 在 kv 维上的长度（本节点）
- 
-    NnUint kvDim0;    // 本节点的 kvDim 局部（可与 kvLen 对齐；保留以兼容旧逻辑）
-    NnSize3D keySize;    // 本节点局部 K 缓冲尺寸
-    NnSize3D valueSize;  // 本节点局部 V 缓冲尺寸
+    NnUint kvStart;   // 本节点 KV 起点
+    NnUint kvLen;     // 本节点 KV 长度
+    NnUint kvDim0;    // 兼容字段
+    NnSize3D keySize;
+    NnSize3D valueSize;
 } NnKvCacheSliceUneven;
 
 typedef struct {
     NnFloatType type;
-
-
-    NnUint inStart;   // 在输入维 D_in 上的起点（本节点）
-    NnUint inLen;     // 在输入维 D_in 上的长度（本节点）
-
-    // —— 语义收敛为“本节点局部” —— 
-    // 原来用于均匀切的 nNodes 建议删除；若保留请忽略
-    // NnUint nNodes;  // <- 不再使用，或在构图时仅作信息提示
-
-    // d0：本节点 matmul 结果的列数（对 Wq/Wk/Wv，等于本节点参与乘积后的输出列）
-    NnUint d0;
-    NnUint n;
+    NnUint inStart;   // 输入维度起点 (Global Row Start)
+    NnUint inLen;     // 输入维度长度 (Global Rows Count)
+    NnUint d0;        // 局部输出列 (Local Output Cols)
+    NnUint n;         // 全局输入维度 (Global Input Dim)
     NnSize3D size;
-
-    // 本节点局部权重切片的 size（保持原字段名，但明确“局部化”）
     NnSize3D sliceSize;
 } NnRowMatmulSliceUneven; 
 
 typedef struct {
     NnFloatType type;
-
-    // —— 新增：非均匀所需（本节点负责的“被切维度”区间）——
-    NnUint outStart;  // 在输出维 D_out 上的起点（本节点）
-    NnUint outLen;    // 在输出维 D_out 上的长度（本节点）
-
-    // —— 语义收敛为“本节点局部” —— 
-    // NnUint nNodes;  // <- 不再使用，或忽略
-    NnUint n;         
-    NnUint n0;        
-    NnUint d;         
+    NnUint outStart;  // 输出维度起点 (Global Col Start)
+    NnUint outLen;    // 输出维度长度 (Local Input Cols)
+    NnUint n;         // 全局输入维度
+    NnUint n0;        // 局部输入维度
+    NnUint d;         // 全局输出维度
     NnSize3D size;        
-    NnSize3D sliceSize;   // 本节点权重切片 size（局部）
-} NnColMatmulSliceUneven;   // 每个节点一份（数组使用）
+    NnSize3D sliceSize;
+} NnColMatmulSliceUneven;
 
 typedef struct {
-    // —— Q 侧 —— 
-    NnUint qDim0;       // 本节点的 q 局部总宽（可保留）
-    NnUint qDimStart;   // 本节点在 Q 维的起点
-    NnUint qDimLen;     // 新增：本节点在 Q 维的长度（明确代替/补充 qDim0）
-
-    // —— 针对缓存/移位，用于定位 —— 
+    NnUint qDim0;
+    NnUint qDimStart;
+    NnUint qDimLen;   // 本节点 Q 长度
     NnUint qShift;
 
-    // —— KV 侧 —— 
-    NnUint kvDim;       // 全局 kv 维（可保留）
-    NnUint kvDim0;      // 本节点 kv 局部（可保留）
-    NnUint kvDimStart;  // 起点
-    NnUint kvDimLen;    // 新增：长度（替代/补充 kvDim0）
+    NnUint kvDim;
+    NnUint kvDim0;
+    NnUint kvDimStart;
+    NnUint kvDimLen;  // 本节点 KV 长度
 
-    // —— 其它参数 —— 
-    NnUint sliceDim;    // 若你在用它表达“本地处理宽度”，可保留；建议在注释中注明其与 *Len 的关系
+    NnUint sliceDim;
     NnUint seqLen;
     NnUint headDim;
     NnUint nKvHeads;
     float  ropeTheta;
-
-    // —— 本节点的 RoPE cache 分配 —— 
-    NnSize3D cacheSize; // 局部 cache 尺寸（由上面长度推导）
+    NnSize3D cacheSize;
 } NnRopeSliceUneven;
 
 typedef struct {
-    // —— 新增：非均匀所需 —— 
-    NnUint headStart;  // 本节点负责的 head 起点（全局编号）
-    NnUint headLen;    // 本节点负责的 head 数量
-
-    // —— 保留：兼容旧语义 —— 
-    NnUint nHeads;     // 全局 head 数
-    NnUint nHeads0;    // 本节点 head 局部（可与 headLen 等价；保留以兼容旧 kernel）
-    NnSize3D attSize;  // 本节点的注意力中间缓冲尺寸（局部）
+    NnUint headStart; // 本节点 Head 起点
+    NnUint headLen;   // 本节点 Head 数量
+    NnUint nHeads;
+    NnUint nHeads0;
+    NnSize3D attSize;
 } NnMultiHeadAttSliceUneven;
 
-// base enums
+// ======================================================================================
+// Base Enums
+// ======================================================================================
 
 enum NnOpCode {
     OP_MERGE_ADD,
@@ -228,7 +266,9 @@ enum NnRopeType {
     ROPE_LLAMA3_1 = 2,
 };
 
-// base configs
+// ======================================================================================
+// Base Configs
+// ======================================================================================
 
 typedef struct {
     char *name;
@@ -290,7 +330,9 @@ typedef struct {
     NnSegmentConfig *segments;
 } NnNodeConfig;
 
-// op configs
+// ======================================================================================
+// Op Configs
+// ======================================================================================
 
 typedef struct {
     // empty
@@ -381,7 +423,9 @@ typedef struct {
     NnUint indexesBufferIndex;
 } NnMoeGateOpCodeConfig;
 
-// utility functions
+// ======================================================================================
+// Functions Declarations
+// ======================================================================================
 
 const char *opCodeToString(NnOpCode code);
 const char *opQuantTypeToString(NnOpQuantType type);
@@ -413,7 +457,7 @@ public:
     NnUint elapsedMicroseconds();
 };
 
-// slicers
+// --- Legacy Slicers ---
 
 NnKvCacheSlice sliceKvCache(NnUint kvDim, NnUint seqLen, NnUint nNodes);
 NnRowMatmulSlice sliceRowMatmul(NnFloatType type, NnUint nNodes, NnUint n, NnUint d);
@@ -421,26 +465,35 @@ NnColMatmulSlice sliceColMatmul(NnFloatType type, NnUint nNodes, NnUint n, NnUin
 NnRopeSlice sliceRope(NnRopeType type, NnUint qDim, NnUint kvDim, NnUint nKvHeads, NnUint nNodes, NnUint seqLen, NnUint headDim, float ropeTheta, NnUint nodeIndex);
 NnMultiHeadAttSlice sliceMultiHeadAtt(NnUint nHeads, NnUint seqLen, NnUint nNodes, NnUint nBatches);
 
-// splitters
+// --- Legacy Splitters ---
 
 NnUint splitRowMatmulWeight(NnRowMatmulSlice *slice, NnUint nodeIndex, NnByte *weight, NnByte *weight0);
 NnUint splitColMatmulWeight(NnColMatmulSlice *slice, NnUint nodeIndex, NnByte *weight, NnByte *weight0);
 
-// rope
+// --- Rope Util ---
 
 void fullfillRopeCache(const NnRopeOpConfig *config, float *cache);
 
+// ======================================================================================
+// Uneven Partition Functions
+// ======================================================================================
+
+// 创建计划 (包含 GQA 对齐修复)
 NnUnevenPartitionPlan createPartitionPlan(
     NnUint nNodes,
     const std::vector<float>& ratios,
     NnUint globalNHeads,
     NnUint globalNKvHeads,
     NnUint globalVocabSize,
-    NnUint globalFfnDim
+    NnUint globalFfnDim,
+    NnUint globalDim
 );
+
+// 释放计划 (旧接口，如果使用栈上对象+析构函数可忽略，但保留以防遗留调用)
 void releasePartitionPlan(NnUnevenPartitionPlan* plan);
 
-// 非均匀 Slicers
+// Slicers
+
 NnKvCacheSliceUneven sliceKvCacheUneven(NnUint seqLen, NnUint headDim,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
@@ -451,13 +504,13 @@ NnRowMatmulSliceUneven sliceRowMatmulAttUneven(NnFloatType type, NnUint globalIn
     const NnDimSplit* headSplit, NnUint globalOutDim, NnUint nodeIndex);
 
 NnColMatmulSliceUneven sliceColMatmulAttUneven(NnFloatType type, NnUint globalInDimQ, NnUint globalOutDim, NnUint headDim,
-    const NnUnevenPartitionPlan* plan,NnUint nodeIndex);
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
 NnRowMatmulSliceUneven sliceRowMatmulFfnUneven(NnFloatType type, NnUint globalInDim, NnUint globalFfnDim,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
-NnColMatmulSliceUneven sliceColMatmulFfnUneven(NnFloatType type, NnUint globalFfnDim, NnUint globalOutDim,const NnUnevenPartitionPlan* plan,
-    NnUint nodeIndex);
+NnColMatmulSliceUneven sliceColMatmulFfnUneven(NnFloatType type, NnUint globalFfnDim, NnUint globalOutDim,
+    const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
 NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen, 
     NnUint globalKvDim, NnUint globalNKvHeads, NnUint headDim, float ropeTheta,
@@ -466,9 +519,9 @@ NnRopeSliceUneven sliceRopeUneven(NnRopeType type, NnUint seqLen,
 NnRowMatmulSliceUneven sliceRowMatmulLogitsUneven(NnFloatType type, NnUint globalInDim, NnUint globalVocabSize,
     const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
-// (您可能还需要 logits/vocab 的 slicer，见问题 4)
+// Splitters
 
-// 非均匀 Splitters
 NnUint splitRowMatmulWeightUneven(NnRowMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0);
 NnUint splitColMatmulWeightUneven(NnColMatmulSliceUneven *slice, NnByte *weight, NnByte *weight0);
-#endif
+
+#endif // NN_CORE_H

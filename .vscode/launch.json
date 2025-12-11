@@ -5,7 +5,7 @@
       "name": "dllama chat",
       "type": "cppdbg",
       "request": "launch",
-      "program": "/workspace/distributed-llama/dllama",
+      "program": "/workspace/dllama/distributed-llama/dllama",
       "args": [
         "chat",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
@@ -83,10 +83,12 @@
     "name": "dllama worker (ASan)",
     "type": "cppdbg",
     "request": "launch",
-    "program": "/workspace/distributed-llama/dllama",
+    "program": "/workspace/dllama/distributed-llama/dllama",
     "args": [
         "worker",
-        "--port", "10086"
+        "--port", "9999",
+        "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
+        "--ratios", "1.0,3.0"
     ],
     "cwd": "/workspace/distributed-llama",
     "stopAtEntry": true,

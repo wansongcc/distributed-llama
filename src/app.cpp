@@ -281,7 +281,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         ratios = parseRatios(args->ratiosStr, nNodes);
         NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
         planPtr.reset(new NnUnevenPartitionPlan(
-            createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim)
+            createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
         ));
         net = buildLlmNetUneven(&header, nNodes, args->nBatches, ratios);
         if (args->info) {
@@ -375,6 +375,8 @@ void runWorkerApp(AppCliArgs *args) {
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();
         NnNodeConfig nodeConfig = configReader.readNode();
+        
+        // Use custom deleters for C-style configs if they need specific cleanup functions
         std::unique_ptr<NnNetConfig, void(*)(NnNetConfig *)> netConfigPtr(&netConfig, releaseNetConfig);
         std::unique_ptr<NnNodeConfig, void(*)(NnNodeConfig *)> nodeConfigPtr(&nodeConfig, releaseNodeConfig);
 
@@ -382,47 +384,58 @@ void runWorkerApp(AppCliArgs *args) {
 
         NnNetExecution execution(args->nThreads, &netConfig);
 
+        // 1. Initialize Plan Pointer
         std::unique_ptr<NnUnevenPartitionPlan> planPtr;
+        
         if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
              LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
              std::vector<float> ratios = parseRatios(args->ratiosStr, netConfig.nNodes);
              NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
              
-             planPtr.reset(new NnUnevenPartitionPlan(
-                 createPartitionPlan(netConfig.nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim)
-             ));
+             // Create the plan value
+             NnUnevenPartitionPlan plan = createPartitionPlan(
+                 netConfig.nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim
+             );
+
+             // Move it to the heap-managed unique_ptr
+             // ideally NnUnevenPartitionPlan should have a move constructor to steal pointers
+             planPtr.reset(new NnUnevenPartitionPlan(std::move(plan)));
         }
 
-
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
+        
+        // Pass raw pointer to synchronizer (it usually just reads from it)
         NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
+        
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
 
         if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
-            // [本地加载]
+            // [Local Loading Mode]
             printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, args->modelPath);
             
-            // 重新加载头信息用于构建临时 Net
+            // Reload header for temporary network construction
             LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
             std::vector<float> ratios = parseRatios(args->ratiosStr, netConfig.nNodes);
             
-            // 修正辅助维度
+            // Fix dimensions if necessary
             if (header.headDim == 0 && header.nHeads > 0) header.headDim = header.dim / header.nHeads;
             header.qDim = header.nHeads * header.headDim;
             header.kvDim = header.nKvHeads * header.headDim;
 
-            // 构建临时 Net
+            // Build temporary Net for loading
             LlmNet tempNet = buildLlmNetUneven(&header, netConfig.nNodes, 1, ratios);
 
-            // 执行本地加载
+            // Execute local loading
             NnLocalWeightLoader localLoader(&executor, nodeConfig.nodeIndex);
+            
+            // Pass the plan pointer
             loadLlmNetWeightUneven(args->modelPath, &tempNet, &localLoader, planPtr.get());
 
             releaseLlmNet(&tempNet);
             printf("✅ Worker %d: Weights loaded locally.\n", nodeConfig.nodeIndex);
 
         } else {
-            // [网络加载] (Legacy)
+            // [Network Loading Mode] (Legacy)
             printf("📡 Worker %d: Waiting for weights from Root...\n", nodeConfig.nodeIndex);
             NnWorkerWeightReader weightReader(&executor, network);
             weightReader.read();
@@ -432,6 +445,7 @@ void runWorkerApp(AppCliArgs *args) {
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
+        
         while (true) {
             try {
                 if (isFirstAttempt)

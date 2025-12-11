@@ -47,36 +47,58 @@ NnSize NnLocalWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize n
 
 NnSize NnLocalWeightLoader::loadRowMatmulSlicesUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex, 
                                                       std::function<NnRowMatmulSliceUneven(NnUint)> slicer, NnByte *weight) {
-    // 1. 计算本节点的切片
+    // 1. 获取本节点的切片信息
     NnRowMatmulSliceUneven slice = slicer(myNodeIndex);
-    NnUint offset = expertIndex * slice.sliceSize.nBytes;
+    
+    // offset: 设备内存中的偏移 (用于 MoE 的 expert 偏移，非 MoE 通常为 0)
+    NnUint deviceOffset = expertIndex * slice.sliceSize.nBytes;
 
-    // 2. 分配临时缓冲区
-    allocate(slice.sliceSize.nBytes);
+    // [优化] Row Parallel (按行/Head 切分) 的数据在文件中是连续存储的。
+    // 我们不需要 allocate temp 和 memcpy，直接计算文件内的偏移量即可。
+    
+    // 2. 计算本节点数据在文件中的起始偏移量
+    // 计算 Block 大小 (例如 Q40 是 32 个 float 一组)
+    NnSize blockSize = getBlockSize(slice.type);
+    NnSize blockBytes = getBytes(slice.type, blockSize);
 
-    // 3. 从完整权重中切分出属于我的部分
-    splitRowMatmulWeightUneven(&slice, weight, temp);
+    // slice.n 是完整的输入维度 (Input Dim / Width)
+    // 校验对齐
+    if (slice.n % blockSize != 0) {
+         throw std::runtime_error("RowMatmul input dim not aligned to block size");
+    }
 
-    // 4. 加载
-    executor->loadWeight(opName, opIndex, offset, slice.sliceSize.nBytes, temp);
+    // 计算“一行”的字节数 (Stride)
+    NnSize bytesPerRow = (slice.n / blockSize) * blockBytes;
 
+    // slice.inStart 是本节点的起始行号
+    NnSize fileByteOffset = slice.inStart * bytesPerRow;
+
+    // 3. 直接加载 (Zero-Copy)
+    // weight 是当前 Tensor 的全局起始位置，weight + fileByteOffset 是本节点数据的起始位置
+    executor->loadWeight(opName, opIndex, deviceOffset, slice.sliceSize.nBytes, weight + fileByteOffset);
+
+    // 4. 关键：返回 Tensor 的【全局大小】，让主循环的 b 指针正确跳过整个 Tensor
     return slice.size.nBytes;
 }
 
 NnSize NnLocalWeightLoader::loadColMatmulSlicesUneven(const char *opName, const NnUint opIndex, const NnUint expertIndex, 
                                                       std::function<NnColMatmulSliceUneven(NnUint)> slicer, NnByte *weight) {
-    // 1. 计算本节点的切片
+    // 1. 获取本节点的切片信息
     NnColMatmulSliceUneven slice = slicer(myNodeIndex);
-    NnUint offset = expertIndex * slice.sliceSize.nBytes;
+    NnUint deviceOffset = expertIndex * slice.sliceSize.nBytes;
 
-    // 2. 分配
+    // 2. Col Parallel (按列切分) 数据在文件中是跨步的 (Strided)。
+    // 也就是数据是 [行0...][行1...]，我们需要取每一行的第 x 到 y 列。
+    // 这在内存中不连续，必须分配 buffer 进行重组。
     allocate(slice.sliceSize.nBytes);
 
-    // 3. 切分
+    // 3. 使用之前的辅助函数，将散落的列数据收集到 temp 缓冲区
+    // splitColMatmulWeightUneven 内部已经处理了复杂的 Strided Copy 逻辑
     splitColMatmulWeightUneven(&slice, weight, temp);
 
-    // 4. 加载
-    executor->loadWeight(opName, opIndex, offset, slice.sliceSize.nBytes, temp);
+    // 4. 加载重组后的连续数据
+    executor->loadWeight(opName, opIndex, deviceOffset, slice.sliceSize.nBytes, temp);
 
+    // 5. 关键：返回 Tensor 的【全局大小】
     return slice.size.nBytes;
 }

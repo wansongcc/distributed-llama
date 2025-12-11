@@ -130,38 +130,47 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
     bool matchFound = false;
 
     if (plan && plan->nNodes == nNodes) {
-        // Lambda: 尝试匹配某个 Split 方案
-        // 如果 Split的总份数 能整除 totalBytes，说明当前 Buffer 就是按这个方案切分的
+        // Helper lambda to check if a specific split configuration matches the current buffer size
         auto tryMatch = [&](const NnDimSplit& split) -> bool {
             NnUint totalUnits = getSplitTotal(split, nNodes);
+            // Check if totalBytes is exactly divisible by the total units (e.g. total heads)
+            // This is a heuristic: if we have 152k bytes and 152k vocab, it matches.
             if (totalUnits > 0 && totalBytes % totalUnits == 0) {
                 NnSize bytesPerUnit = totalBytes / totalUnits;
-                // 填充 Offsets 和 Sizes
+                
+                NnSize currentOffset = 0;
                 for (NnUint i = 0; i < nNodes; ++i) {
-                    offsets[i] = split.starts[i] * bytesPerUnit;
-                    sizes[i]   = split.lengths[i] * bytesPerUnit;
+                    NnSize len = split.lengths[i] * bytesPerUnit;
+                    offsets[i] = currentOffset; // Recalculate offset to be safe
+                    sizes[i] = len;
+                    currentOffset += len;
                 }
                 return true;
             }
             return false;
         };
 
-        // 按优先级尝试匹配 (Vocab > FFN > Heads > KV)
-        // Logits (Vocab) 通常最大，最容易区分
+        // Priority order for matching:
+        // 1. Vocab (Logits) - Largest, usually most critical for the "degeneration" bug
         if (!matchFound) matchFound = tryMatch(plan->vocabSplit);
+        // 2. FFN - Intermediate layers
         if (!matchFound) matchFound = tryMatch(plan->ffnSplit);
+        // 3. Dim - General dimension splits
+        if (!matchFound) matchFound = tryMatch(plan->dimSplit);
+        // 4. Heads - Attention Q
         if (!matchFound) matchFound = tryMatch(plan->headSplit);
+        // 5. KV Heads - Attention K/V
         if (!matchFound) matchFound = tryMatch(plan->kvHeadSplit);
     }
 
-    // Fallback: 如果没有 Plan 或者没有匹配的 Split，使用均匀切分
+    // Fallback: Uniform partitioning
     if (!matchFound) {
         NnSize avgBytes = totalBytes / nNodes;
         for (NnUint i = 0; i < nNodes; ++i) {
             sizes[i] = avgBytes;
             offsets[i] = i * avgBytes;
         }
-        // 修正最后一个节点以处理余数 (虽然 totalBytes 应该对齐，但防万一)
+        // Fix rounding error for the last node
         offsets[nNodes - 1] = (nNodes - 1) * avgBytes;
         sizes[nNodes - 1] = totalBytes - offsets[nNodes - 1];
     }
@@ -650,55 +659,85 @@ static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, N
 
 static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex, const NnUnevenPartitionPlan *plan) {
     bool isWorker = nodeIndex != 0;
-    NnUint nSockets = onlyFromWorkerToRoot && isWorker ? 1 : network->nSockets;
+    // Determine the number of active sockets involved in this sync
+    // If only sending to root, worker only talks to socket 0.
+    // Otherwise (full sync), everyone talks to everyone.
+    NnUint nSockets = (onlyFromWorkerToRoot && isWorker) ? 1 : network->nSockets;
     
-    // 计算当前线程负责的 Socket 数量
+    // Calculate how many sockets this specific thread should handle
     NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
     if (nSocketsPerThread == 0) return;
 
-    // [关键] 1. 计算所有节点的 Slice 信息
-    // sliceOffsets[i] 表示节点 i 的数据在 buffer 中的起始字节
-    // sliceSizes[i]   表示节点 i 的数据长度
+    // [CRITICAL FIX] Calculate exact offsets and sizes for ALL nodes based on the plan
+    // This ensures that Root knows exactly how much data to expect from Worker 1 (e.g. 75% of buffer)
+    // instead of defaulting to 50%.
     std::vector<NnSize> sliceOffsets(nNodes);
     std::vector<NnSize> sliceSizes(nNodes);
+    
+    // Use the robust fill function (ensure this function definition is available above)
     fillUnevenSlices(plan, nNodes, nBytes, sliceOffsets, sliceSizes);
 
     std::vector<NnSocketIo> ios(nSocketsPerThread);
 
-    // [关键] 2. 发送阶段 (Send)
-    // 如果我是发送者 (Root 总是发送; Worker 在 !onlyFromWorkerToRoot 时发送)
-    if (!onlyFromWorkerToRoot || isWorker) {
-        // 获取 **我自己 (nodeIndex)** 负责的那部分数据
+    // --- SEND PHASE ---
+    // Rule: Root always sends (in full sync). Worker sends if it's not a "Receive-Only" scenario (which doesn't exist here really)
+    // Actually: 
+    // - SYNC_NODE_SLICES: Everyone sends their slice to everyone.
+    // - SYNC_NODE_SLICES_EXCEPT_ROOT: Workers send to Root. Root does NOT send.
+    
+    bool iShouldSend = true;
+    if (onlyFromWorkerToRoot && !isWorker) iShouldSend = false; // Root doesn't send in EXCEPT_ROOT mode
+
+    if (iShouldSend) {
+        // I send MY slice (determined by nodeIndex)
         NnByte *mySliceData = &buffer[sliceOffsets[nodeIndex]];
         NnSize mySliceSize = sliceSizes[nodeIndex];
 
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             NnUint socketIndex = threadIndex + i * nThreads;
+            
+            // In "onlyFromWorkerToRoot" mode for a worker, socket 0 connects to Root.
+            // In normal mode, socketIndex corresponds to the connection index.
+            
             ios[i].socketIndex = socketIndex;
             ios[i].data = mySliceData;
-            ios[i].size = mySliceSize; // 发送我的非均匀大小
+            ios[i].size = mySliceSize; // Send the CORRECT uneven size
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
     }
 
-    // [关键] 3. 接收阶段 (Receive)
-    // 如果我是接收者 (Root 总是接收; Worker 在 !onlyFromWorkerToRoot 时接收)
-    if (!onlyFromWorkerToRoot || !isWorker) {
+    // --- RECEIVE PHASE ---
+    // Rule: Root always receives. Worker receives only in full sync.
+    bool iShouldRecv = true;
+    if (onlyFromWorkerToRoot && isWorker) iShouldRecv = false; // Worker doesn't recv in EXCEPT_ROOT mode
+
+    if (iShouldRecv) {
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             NnUint socketIndex = threadIndex + i * nThreads;
             
-            // 计算 Socket 对应的 目标节点 ID
-            // (Root 的 socket 0 连 Node 1, socket 1 连 Node 2...)
-            // (Worker 的 socket 0 连 Root(Node 0), socket 1 连 Node 2...)
-            NnUint targetNodeIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
+            // Determine which node is on the other end of this socket
+            // Root's sockets: [0 -> Node1], [1 -> Node2]...
+            // Worker's sockets: [0 -> Root(Node0)], [1 -> Node2]...
+            NnUint targetNodeIndex;
+            if (nodeIndex == 0) {
+                // I am Root. Socket 0 is Node 1.
+                targetNodeIndex = socketIndex + 1;
+            } else {
+                // I am Worker K. 
+                // Socket < K corresponds to Node i (0..K-1)
+                // Socket >= K corresponds to Node i+1 (K+1...N)
+                // (Assuming standard fully connected mesh or star topology logic in distributed-llama)
+                if (socketIndex < nodeIndex) targetNodeIndex = socketIndex;
+                else targetNodeIndex = socketIndex + 1;
+            }
 
-            // 使用 **目标节点 (targetNodeIndex)** 的 Offset 和 Size
+            // [CRITICAL] Use the TARGET node's size and offset
             NnByte *targetSliceData = &buffer[sliceOffsets[targetNodeIndex]];
             NnSize targetSliceSize = sliceSizes[targetNodeIndex];
 
             ios[i].socketIndex = socketIndex;
             ios[i].data = targetSliceData;
-            ios[i].size = targetSliceSize; // 接收目标的非均匀大小
+            ios[i].size = targetSliceSize; // Expect the CORRECT uneven size
         }
         network->readMany(nSocketsPerThread, &ios[0]);
     }

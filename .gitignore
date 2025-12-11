@@ -17,3 +17,4 @@ server
 /dllama-*
 *.exe
 *.spv
+.vscode/launch.json
