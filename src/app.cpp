@@ -10,6 +10,9 @@
     #include "nn/nn-vulkan.hpp"
 #endif
 
+// 引入 LLM 头文件以获取 createPartitionPlan 等定义
+#include "llm.hpp"
+
 static NnFloatType parseFloatType(char *val) {
     if (std::strcmp(val, "f32") == 0) return F_32;
     if (std::strcmp(val, "f16") == 0) return F_16;
@@ -173,6 +176,192 @@ static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
     return ratios;
 }
 
+// [修改] 解析多 Stage 格式: "1.0:10;0.5,0.5:14"
+// 1. 分号 ';' 或 竖线 '|' 分隔不同的 Stage
+// 2. 冒号 ':' 分隔 TP比例 和 层数 (可选，如果不填则自动分配)
+// 3. 逗号 ',' 分隔同一 Stage 内的 TP 节点比例
+// [修改] 解析多 Stage 格式，并支持按算力比例自动切分层数
+static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNodes, NnUint nLayers) {
+    printf("🔍 [DEBUG] parseStageDefs received: \"%s\"\n", ratiosStr);
+
+    std::vector<NnStageDef> stages;
+    std::string s(ratiosStr);
+    
+    // 1. 兼容性处理：将 | 替换为 ;
+    for (char &c : s) {
+        if (c == '|') c = ';';
+    }
+
+    std::stringstream ss(s);
+    std::string segment;
+    
+    NnUint totalExplicitLayers = 0;
+    std::vector<int> autoLayerIndices; // 记录哪些 Stage 需要自动分配
+
+    // 2. 解析每个 Stage
+    while (std::getline(ss, segment, '*')) {
+        if (segment.empty()) continue;
+        
+        NnStageDef stage;
+        stage.nLayers = 0; // 0 表示未指定，稍后自动分配
+
+        // 检查冒号 ':' (显式指定层数)
+        size_t colonPos = segment.find(':');
+        std::string ratioPart = segment;
+        
+        if (colonPos != std::string::npos) {
+            ratioPart = segment.substr(0, colonPos);
+            std::string layerPart = segment.substr(colonPos + 1);
+            try {
+                stage.nLayers = (NnUint)std::stoi(layerPart);
+                totalExplicitLayers += stage.nLayers;
+            } catch (...) {
+                throw std::invalid_argument("Invalid layer count: " + layerPart);
+            }
+        }
+
+        // 解析 TP 比例
+        std::stringstream ss2(ratioPart);
+        std::string ratio;
+        while (std::getline(ss2, ratio, ',')) {
+            if (ratio.empty()) continue;
+            try {
+                stage.tpRatios.push_back(std::stof(ratio));
+            } catch (...) {
+                throw std::invalid_argument("Invalid ratio value: " + ratio);
+            }
+        }
+        
+        if (stage.tpRatios.empty()) {
+             throw std::invalid_argument("Empty stage definition found");
+        }
+        
+        if (stage.nLayers == 0) {
+            autoLayerIndices.push_back(stages.size());
+        }
+        
+        stages.push_back(stage);
+    }
+
+    // 3. 校验节点总数
+    NnUint totalNodesParsed = 0;
+    for(const auto& stage : stages) {
+        totalNodesParsed += stage.tpRatios.size();
+    }
+    
+    if (totalNodesParsed != nNodes) {
+        throw std::invalid_argument(
+            "Ratios defined " + std::to_string(totalNodesParsed) + 
+            " nodes, but expected " + std::to_string(nNodes) + 
+            " (check --workers count)"
+        );
+    }
+
+    // 4. [核心修改] 按权重比例分配层数
+    if (totalExplicitLayers > nLayers) {
+        throw std::invalid_argument("Explicit layers count exceeds total model layers");
+    }
+
+    NnUint remainingLayers = nLayers - totalExplicitLayers;
+    size_t nAutoStages = autoLayerIndices.size();
+
+    if (nAutoStages > 0) {
+        // 计算每个自动分配 Stage 的“总算力权重”
+        std::vector<float> stageWeights;
+        float totalWeight = 0.0f;
+
+        for (int idx : autoLayerIndices) {
+            float w = 0.0f;
+            // Stage 的权重 = 该 Stage 内所有节点的 Ratio 之和
+            // (例如 "0.5,0.5" 的权重是 1.0, "2.0" 的权重是 2.0)
+            for (float r : stages[idx].tpRatios) w += r;
+            stageWeights.push_back(w);
+            totalWeight += w;
+        }
+
+        if (totalWeight <= 1e-6) {
+            // 兜底：如果权重全是 0，退化为平均分配
+            NnUint base = remainingLayers / nAutoStages;
+            NnUint remain = remainingLayers % nAutoStages;
+            for (size_t i = 0; i < nAutoStages; ++i) {
+                stages[autoLayerIndices[i]].nLayers = base + (i < remain ? 1 : 0);
+            }
+        } else {
+            // 按比例分配
+            NnUint allocatedSoFar = 0;
+            for (size_t i = 0; i < nAutoStages; ++i) {
+                int stageIdx = autoLayerIndices[i];
+                NnUint myLayers;
+
+                if (i == nAutoStages - 1) {
+                    // 最后一个 Stage 拿走剩余所有，消除舍入误差
+                    myLayers = remainingLayers - allocatedSoFar;
+                } else {
+                    // 计算比例: (MyWeight / TotalWeight) * Remaining
+                    float ratio = stageWeights[i] / totalWeight;
+                    myLayers = (NnUint)std::round(remainingLayers * ratio);
+                    
+                    // 边界检查：防止溢出或分配为0（除非算力真的极小）
+                    if (allocatedSoFar + myLayers > remainingLayers) {
+                        myLayers = remainingLayers - allocatedSoFar;
+                    }
+                }
+                
+                stages[stageIdx].nLayers = myLayers;
+                allocatedSoFar += myLayers;
+                
+                printf("⚖️  [Auto-Split] Stage %d (Weight %.2f): Assigned %u layers\n", 
+                       stageIdx, stageWeights[i], myLayers);
+            }
+        }
+    } else {
+        if (remainingLayers != 0) {
+            throw std::invalid_argument("Explicit layers sum does not match total model layers");
+        }
+    }
+    
+    return stages;
+}
+
+void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
+    printf("\n🔍 [DEBUG] Pipeline Partition Plan Verification:\n");
+    printf("===================================================\n");
+    printf("🌎 Global Stats: Total Nodes: %u, Total Stages: %u\n", plan->nNodes, plan->nStages);
+
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig& stage = plan->stages[s];
+        printf("\n➡️  [Stage %u]\n", stage.stageIndex);
+        printf("    ├─ Range:      Layers %u to %u (Count: %u)\n", 
+               stage.startLayer, stage.endLayer - 1, stage.nLayers);
+        printf("    ├─ Root Node:  %u\n", stage.rootNodeIndex);
+        printf("    ├─ Member Nodes: [ ");
+        for(NnUint i=0; i<stage.nNodes; ++i) printf("%u ", stage.nodeIndices[i]);
+        printf("]\n");
+
+        printf("    └─ 🔍 TP Split Isolation Check:\n");
+        NnUint headSum = 0;
+        NnUint kvSum = 0;
+        NnUint dimSum = 0;
+
+        for(NnUint i=0; i<stage.nNodes; ++i) {
+            NnUint globalNodeIdx = stage.nodeIndices[i];
+            
+            NnUint hLen = plan->headSplit.lengths[globalNodeIdx];
+            NnUint kLen = plan->kvHeadSplit.lengths[globalNodeIdx];
+            NnUint dLen = plan->dimSplit.lengths[globalNodeIdx];
+            
+            headSum += hLen;
+            kvSum += kLen;
+            dimSum += dLen;
+
+            printf("       • Node %u: Heads=%u, KV=%u, Dim=%u\n", 
+                   globalNodeIdx, hLen, kLen, dLen);
+        }
+        printf("       ✅ Stage Sums: Heads=%u, KV=%u, Dim=%u\n", headSum, kvSum, dimSum);
+    }
+    printf("===================================================\n\n");
+}
+
 static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *plan = nullptr) {
     std::vector<NnExecutorDevice> devices;
 
@@ -247,6 +436,7 @@ bool WorkerLlmInference::tryReadControlPacket() {
     const unsigned long maxAttempts = 10000;
     if (!network->tryReadWithMaxAttempts(ROOT_SOCKET_INDEX, &controlPacket, sizeof(LlmControlPacket), maxAttempts))
         return false;
+    printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);    
     if (controlPacket.batchSize == 0) {
         printf("🛑 Stop signal\n");
         isFinished = true;
@@ -261,11 +451,10 @@ bool WorkerLlmInference::tryReadControlPacket() {
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+
     if (nNodes > header.nKvHeads)
         // TODO: https://github.com/b4rtaz/distributed-llama/issues/70
         throw std::runtime_error("This version does not support more nodes than the number of KV heads in the model");
-    if (header.weightType == F_Q40 && header.syncType != F_Q80)
-        throw std::runtime_error("This version supports only Q40 weights with Q80 sync type");
 
     Tokenizer tokenizer(args->tokenizerPath);
     if (args->info && tokenizer.vocabSize != header.vocabSize)
@@ -278,19 +467,25 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     if(args->ratiosStr != nullptr){
         printf("nNodes=%d\n", nNodes);
-        ratios = parseRatios(args->ratiosStr, nNodes);
+        std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, nNodes, header.nLayers);
         NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
+
         planPtr.reset(new NnUnevenPartitionPlan(
-            createPartitionPlan(nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
+            createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
         ));
-        net = buildLlmNetUneven(&header, nNodes, args->nBatches, ratios);
+        
+        // 使用 Uneven Builder (传入 planPtr)
+        net = buildLlmNetUneven(&header, nNodes, args->nBatches, planPtr.get());
+        
         if (args->info) {
             printf("⚖️  Uneven partitioning strategy enabled: %s\n", args->ratiosStr);
+            printPartitionPlanDebug(planPtr.get());
         }
-    }else{
+    } else {
         printf("⚖️  Even partitioning strategy enabled: ");
         net = buildLlmNet(&header, nNodes, args->nBatches);
     }
+    
     std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
@@ -312,33 +507,28 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     } else {
         networkPtr = NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts);
         network = networkPtr.get();
+        // 初始化 Synchronizer (传入 Plan)
         synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get()));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
     }
 
-    // initialize uneven partition plan if needed
-
-
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
     NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
 
     // Load weights
     if (args->ratiosStr != nullptr) {
-        // [非均匀模式]：强制使用本地加载 (Local Loading)
-        // 摒弃网络传输，Root 节点直接从本地文件加载属于自己的部分。
+        // [非均匀/PP 模式]：强制使用本地加载 (Local Loading)
         printf("🚀 Local Loading Mode (Root): Loading weights locally...\n");
-        // 创建本地加载器 (指定 Root 的 index为 0)
-        NnLocalWeightLoader localLoader(&executor, 0); 
         
-        // 调用非均匀加载函数 (传入 Plan 和 LocalLoader)
-        loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, planPtr.get());
+        NnLocalWeightLoader localLoader(&executor, 0); 
+        // 传入 0 作为 Root 的 nodeIndex
+        loadLlmNetWeightUneven(args->modelPath, &net, &localLoader, planPtr.get(), 0);
         printf("✅ Root: Weights loaded locally.\n");
 
     } else {
-        // [均匀模式]：保持原有行为 (使用 NnRootWeightLoader)
-        // 这里的 NnRootWeightLoader 可能会通过网络将权重分发给 Worker
+        // [均匀模式]：保持原有行为 (网络分发)
         NnRootWeightLoader weightLoader(&executor, network, nNodes);
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
@@ -376,7 +566,6 @@ void runWorkerApp(AppCliArgs *args) {
         NnNetConfig netConfig = configReader.readNet();
         NnNodeConfig nodeConfig = configReader.readNode();
         
-        // Use custom deleters for C-style configs if they need specific cleanup functions
         std::unique_ptr<NnNetConfig, void(*)(NnNetConfig *)> netConfigPtr(&netConfig, releaseNetConfig);
         std::unique_ptr<NnNodeConfig, void(*)(NnNodeConfig *)> nodeConfigPtr(&nodeConfig, releaseNodeConfig);
 
@@ -384,27 +573,30 @@ void runWorkerApp(AppCliArgs *args) {
 
         NnNetExecution execution(args->nThreads, &netConfig);
 
-        // 1. Initialize Plan Pointer
+        // 1. Initialize Plan Pointer (Worker Side)
         std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         
         if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
+             // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
              LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
-             std::vector<float> ratios = parseRatios(args->ratiosStr, netConfig.nNodes);
+             
+             // [兼容性修复] 自动切换 Q80
+             if (header.weightType == F_Q40 && header.syncType != F_Q80) {
+                 header.syncType = F_Q80;
+             }
+
+             std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, netConfig.nNodes, header.nLayers);
              NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
              
-             // Create the plan value
-             NnUnevenPartitionPlan plan = createPartitionPlan(
-                 netConfig.nNodes, ratios, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim
-             );
 
-             // Move it to the heap-managed unique_ptr
-             // ideally NnUnevenPartitionPlan should have a move constructor to steal pointers
-             planPtr.reset(new NnUnevenPartitionPlan(std::move(plan)));
+             planPtr.reset(new NnUnevenPartitionPlan(
+                 createPartitionPlan(stageDefs, header.nHeads, header.nKvHeads, header.vocabSize, ffDim, header.dim)
+             ));
         }
 
-        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
+        std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution, planPtr.get());
         
-        // Pass raw pointer to synchronizer (it usually just reads from it)
+        // Initialize Synchronizer with Plan
         NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
         
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
@@ -415,21 +607,17 @@ void runWorkerApp(AppCliArgs *args) {
             
             // Reload header for temporary network construction
             LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
-            std::vector<float> ratios = parseRatios(args->ratiosStr, netConfig.nNodes);
             
-            // Fix dimensions if necessary
-            if (header.headDim == 0 && header.nHeads > 0) header.headDim = header.dim / header.nHeads;
-            header.qDim = header.nHeads * header.headDim;
-            header.kvDim = header.nKvHeads * header.headDim;
-
-            // Build temporary Net for loading
-            LlmNet tempNet = buildLlmNetUneven(&header, netConfig.nNodes, 1, ratios);
+            // Build temporary Net for loading context
+            // 这里我们需要构建一个临时的 LlmNet 结构，因为 loader 需要 net 指针
+            // 关键：确保临时 Net 的 Plan 和 NodeConfig 绑定正确
+            LlmNet tempNet = buildLlmNetUneven(&header, netConfig.nNodes, 1, planPtr.get());
 
             // Execute local loading
             NnLocalWeightLoader localLoader(&executor, nodeConfig.nodeIndex);
             
-            // Pass the plan pointer
-            loadLlmNetWeightUneven(args->modelPath, &tempNet, &localLoader, planPtr.get());
+            // 使用新版 5 参数加载函数
+            loadLlmNetWeightUneven(args->modelPath, &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
 
             releaseLlmNet(&tempNet);
             printf("✅ Worker %d: Weights loaded locally.\n", nodeConfig.nodeIndex);

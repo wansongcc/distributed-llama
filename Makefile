@@ -94,9 +94,9 @@ uneven-slice-test: src/test/test_UnevenSlice.cpp nn-quants.o nn-core.o
 worker-load-test: src/test/test_LoadWeightLoacl.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o nn-network-local.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 # [TAB]
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
-run-worker-load-test: worker-load-test
-# [TAB] 请替换为您的实际路径
-	./worker-load-test /workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m "1.0,3.0"
+Hybie-plan-test: src/test/test_pp_tp.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o ${DEPS}
+# [TAB]
+	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama: src/dllama.cpp nn-quants.o nn-network-local.o nn-network.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}

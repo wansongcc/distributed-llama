@@ -73,14 +73,20 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
 
         NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
         if (segmentConfig->nOps > 0) {
+            printf("🔧 [DEBUG] Creating Segment %u ...\n", segmentIndex);
             NnDeviceSegment *segment = device->createSegment(segmentIndex);
             segments[segmentIndex] = std::unique_ptr<NnDeviceSegment>(segment);
 
-            for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++)
+            for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
+                printf("  🔨 [DEBUG] Adding Step: Segment %u, Op %u (%s)\n", segmentIndex, opIndex, segmentConfig->ops[opIndex].name);
                 steps.push_back(NnExecutorStep{ STEP_EXECUTE_OP, segment, opIndex, &segmentConfig->ops[opIndex] });
+            }
         }
-        if (useSynchronizer && segmentConfig->nSyncs > 0)
+        if (useSynchronizer && segmentConfig->nSyncs > 0){
+            printf("  📡 [DEBUG] Adding Step: Segment %u, Sync Nodes (%u syncs)\n", segmentIndex, segmentConfig->nSyncs);
             steps.push_back(NnExecutorStep{ STEP_SYNC_NODES, nullptr, segmentIndex, nullptr });
+        }
+
     }
 
     steps.shrink_to_fit();

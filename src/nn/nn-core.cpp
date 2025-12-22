@@ -2,6 +2,7 @@
     #define _USE_MATH_DEFINES
 #endif
 #include "nn-core.hpp"
+#include "nn-quants.hpp"
 #include <cassert>
 #include <cstring>
 #include <cmath>
@@ -373,74 +374,151 @@ NnDimSplit createDimSplit(NnUint totalDim, const std::vector<float>& ratios) {
     return NnDimSplit{starts, lengths};
 }
 
+// 参数 offset: 全局节点 ID 的起始偏移 (例如 Stage 1 从 Node 2 开始)
+static void fillDimSplitForStage(NnDimSplit& split, NnUint offset, NnUint totalDim, const std::vector<float>& ratios, NnUint alignSize) {
+    NnUint nLocalNodes = ratios.size();
+    
+    float ratioSum = 0;
+    for(float r : ratios) ratioSum += r;
+    if (ratioSum < 1e-6) throw std::invalid_argument("Ratio sum is too small");
+
+    NnUint currentStart = 0; 
+    NnUint remainingDim = totalDim;
+
+    for(NnUint i = 0; i < nLocalNodes; i++) {
+        NnUint globalNodeIdx = offset + i;
+        
+        split.starts[globalNodeIdx] = currentStart;
+        
+        NnUint len;
+        if(i == nLocalNodes - 1) {
+            len = remainingDim; 
+        } else {
+            double ideal = (double)totalDim * (ratios[i] / ratioSum);
+            len = (NnUint)round(ideal);
+            
+            // [修改] 使用传入的 alignSize 进行对齐
+            if (alignSize > 1) {
+                NnUint remainder = len % alignSize;
+                if (remainder != 0) {
+                    if (remainder >= alignSize / 2) {
+                        len += (alignSize - remainder);
+                    } else {
+                        // 防止变成 0 (除非 alignSize 本身很大而 ideal 很小，
+                        // 但对于 Dim 来说通常够大。对于 Head 来说 alignSize=1 不会进这里)
+                        if (len > remainder) len -= remainder;
+                    }
+                }
+                // 极小值保护：如果是维度切分，至少保留一个块
+                if (len == 0 && totalDim >= nLocalNodes * alignSize) len = alignSize;
+            }
+            
+            if (len > remainingDim) len = remainingDim;
+        }
+        
+        split.lengths[globalNodeIdx] = len;
+        
+        currentStart += len;
+        remainingDim -= len;
+    }
+}
+
 NnUnevenPartitionPlan createPartitionPlan(
-    NnUint nNodes,
-    const std::vector<float>& ratios,
+    const std::vector<NnStageDef>& stageDefs,
     NnUint globalNHeads,
     NnUint globalNKvHeads,
     NnUint globalVocabSize,
     NnUint globalFfnDim,
     NnUint globalDim
 ) {
-    if (nNodes == 0) {
-        throw std::invalid_argument("nNodes must be greater than 0");
-    }
-    if (nNodes != ratios.size()) {
-        printf("🚨 CRITICAL ERROR in createPartitionPlan: nNodes=%u, ratios.size()=%zu\n", nNodes, ratios.size());
-        throw std::invalid_argument("nNodes must match ratios.size()");
-    }
+    NnUnevenPartitionPlan plan;
     
+    // 1. 基础校验与统计
+    if (stageDefs.empty()) throw std::invalid_argument("No stages defined");
+    
+    plan.nStages = stageDefs.size();
+    plan.nNodes = 0;
+    for (const auto& stage : stageDefs) {
+        if (stage.tpRatios.empty()) throw std::invalid_argument("Stage must have nodes");
+        plan.nNodes += stage.tpRatios.size();
+    }
+
+    // 2. 初始化全局数组
+    plan.stages = new NnStageConfig[plan.nStages];
+    
+    // Helper to allocate split arrays
+    auto allocSplit = [&](NnDimSplit& s) {
+        s.starts = new NnUint[plan.nNodes];
+        s.lengths = new NnUint[plan.nNodes];
+        std::memset(s.starts, 0, plan.nNodes * sizeof(NnUint));
+        std::memset(s.lengths, 0, plan.nNodes * sizeof(NnUint));
+    };
+    
+    allocSplit(plan.headSplit);
+    allocSplit(plan.kvHeadSplit);
+    allocSplit(plan.vocabSplit);
+    allocSplit(plan.ffnSplit);
+    allocSplit(plan.dimSplit);
+
+    // GQA Check
     if (globalNHeads % globalNKvHeads != 0) {
-        throw std::runtime_error("nHeads must be divisible by nKvHeads for GQA alignment");
+        throw std::runtime_error("nHeads must be divisible by nKvHeads");
     }
     NnUint gqaGroupSize = globalNHeads / globalNKvHeads;
 
-    NnUnevenPartitionPlan plan;
-    plan.nNodes = nNodes;
-
-    plan.headSplit = {nullptr, nullptr};
-    plan.kvHeadSplit = {nullptr, nullptr};
-    plan.vocabSplit = {nullptr, nullptr};
-    plan.ffnSplit = {nullptr, nullptr};
     try {
-// -------------------------------------------------------------------
-        // 2. 核心修复：基于 GQA 对齐的切分
-        // 先切分 KV Heads (数量较少，必须是整数)
-        // -------------------------------------------------------------------
-        plan.kvHeadSplit = createDimSplit(globalNKvHeads, ratios);
+        NnUint currentNodeOffset = 0;
+        NnUint currentLayerOffset = 0;
 
-        // 基于 KV 的切分结果，强制推导 Q Heads 的切分
-        // 确保 Q Head 数量严格等于 KV Head 数量 * Group Size
-        plan.headSplit.starts = new NnUint[nNodes];
-        plan.headSplit.lengths = new NnUint[nNodes];
+        // 3. 逐个 Stage 生成配置
+        for (NnUint s = 0; s < plan.nStages; s++) {
+            const NnStageDef& def = stageDefs[s];
+            NnStageConfig& config = plan.stages[s];
 
-        for (NnUint i = 0; i < nNodes; i++) {
-            // Q Starts = KV Starts * Group Size
-            plan.headSplit.starts[i] = plan.kvHeadSplit.starts[i] * gqaGroupSize;
-            // Q Lengths = KV Lengths * Group Size
-            plan.headSplit.lengths[i] = plan.kvHeadSplit.lengths[i] * gqaGroupSize;
+            // 3.1 填充 Stage 拓扑信息
+            config.stageIndex = s;
+            config.startLayer = currentLayerOffset;
+            config.nLayers = def.nLayers;
+            config.endLayer = config.startLayer + config.nLayers;
+            
+            config.nNodes = def.tpRatios.size();
+            config.rootNodeIndex = currentNodeOffset; // 默认 Stage 的第一个节点是 Root
+            config.nodeIndices = new NnUint[config.nNodes];
+            for (NnUint i = 0; i < config.nNodes; i++) {
+                config.nodeIndices[i] = currentNodeOffset + i;
+            }
+
+            // 3.2 填充该 Stage 内的 TP Split
+            // 注意：每个 Stage 都是一个独立的 TP 组，所以维度必须在该 Stage 内完整分配
+            
+            // KV Heads
+            fillDimSplitForStage(plan.kvHeadSplit, currentNodeOffset, globalNKvHeads, def.tpRatios, 1);
+            
+            // Q Heads (GQA 对齐)
+            // 基于刚刚生成的 KV Split 计算 Q Split
+            for (NnUint i = 0; i < config.nNodes; i++) {
+                NnUint globalIdx = currentNodeOffset + i;
+                plan.headSplit.starts[globalIdx] = plan.kvHeadSplit.starts[globalIdx] * gqaGroupSize;
+                plan.headSplit.lengths[globalIdx] = plan.kvHeadSplit.lengths[globalIdx] * gqaGroupSize;
+            }
+
+            // FFN & Dim (Hidden Size)
+            fillDimSplitForStage(plan.ffnSplit, currentNodeOffset, globalFfnDim, def.tpRatios, 32);
+            fillDimSplitForStage(plan.dimSplit, currentNodeOffset, globalDim, def.tpRatios, 32);
+
+            // Vocab (Logits)
+            // 虽然只有 Last Stage 真正计算 Logits，但为了逻辑统一，
+            // 我们为所有 Stage 都计算 Vocab Split (Loader 会根据层号自动跳过非 Logits 层)
+            fillDimSplitForStage(plan.vocabSplit, currentNodeOffset, globalVocabSize, def.tpRatios, 32);
+
+            // 推进偏移量
+            currentNodeOffset += config.nNodes;
+            currentLayerOffset += config.nLayers;
         }
 
-        // -------------------------------------------------------------------
-        // 3. 其他维度的切分保持不变
-        // -------------------------------------------------------------------
-        plan.vocabSplit = createDimSplit(globalVocabSize, ratios);
-        plan.ffnSplit = createDimSplit(globalFfnDim, ratios);
-        plan.dimSplit = createDimSplit(globalDim, ratios);
-    } catch (const std::exception& e) {
-        // --- 5. 清理 ---
-        // 如果 kvHeadSplit 创建失败, 需确保已分配的 headSplit 被释放
-        delete[] plan.headSplit.starts;
-        delete[] plan.headSplit.lengths;
-        delete[] plan.kvHeadSplit.starts;
-        delete[] plan.kvHeadSplit.lengths;
-        delete[] plan.vocabSplit.starts;
-        delete[] plan.vocabSplit.lengths;
-        delete[] plan.ffnSplit.starts;
-        delete[] plan.ffnSplit.lengths;
-        
-        // 重新抛出异常
-        throw std::runtime_error(std::string("Failed to create partition plan: ") + e.what());
+    } catch (...) {
+        // NnUnevenPartitionPlan 析构函数会处理内存释放
+        throw;
     }
 
     return plan;

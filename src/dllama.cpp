@@ -50,6 +50,23 @@ static void inference(AppInferenceContext *context) {
             context->inference->setToken(i, inputTokens[pos + i]);
 
         context->inference->forward();
+        float* logits = context->inference->logitsPipe;
+        NnUint vocabSize = context->header->vocabSize;
+        bool hasNaN = false;
+        bool hasInf = false;
+        float maxLogit = -1e9;
+        float minLogit = 1e9;
+        int maxIndex = -1;
+
+        // 简单抽样检查或全量检查
+        for (NnUint i = 0; i < vocabSize; ++i) {
+            float val = logits[i];
+            if (std::isnan(val)) hasNaN = true;
+            if (std::isinf(val)) hasInf = true;
+            if (val > maxLogit) { maxLogit = val; maxIndex = i; }
+            if (val < minLogit) minLogit = val;
+        }
+
 
         pos += batchSize;
         token = inputTokens[pos + 1];
@@ -65,6 +82,10 @@ static void inference(AppInferenceContext *context) {
             sentBytes / 1024,
             recvBytes / 1024,
             batchSize);
+        printf("🧪 [Root Logits] Valid: %s | Range: [%.2f, %.2f] | MaxIdx: %d | NetDelta: S=%zu R=%zu\n", 
+            (hasNaN || hasInf) ? "❌ FAIL" : "✅ OK", 
+            minLogit, maxLogit, maxIndex, 
+            sentBytes, recvBytes);
         evalTotalTime += evalTime + syncTime;
     }
 

@@ -9,6 +9,7 @@
 #include <cstring> // for std::memset
 #include <utility> // for std::move
 #include "nn-quants.hpp"
+#include "nn-core.hpp"
 
 // ======================================================================================
 // Primitives
@@ -30,11 +31,51 @@ typedef struct {
 } NnDimSplit;
 
 // ======================================================================================
+// Pipeline Parallelism Configs
+// ======================================================================================
+
+// [新增] 用于 createPartitionPlan 的输入参数，描述一个 Stage 的需求
+struct NnStageDef {
+    NnUint nLayers;              // 该 Stage 负责多少层
+    std::vector<float> tpRatios; // 该 Stage 内部的 TP 比例 (例如 {1.0, 3.0})
+};
+
+// [新增] 描述一个 Stage 的具体配置 (生成后的结果)
+struct NnStageConfig {
+    NnUint stageIndex;      // Stage ID (0, 1, ...)
+    NnUint startLayer;      // 起始层 (全局索引)
+    NnUint endLayer;        // 结束层 (全局索引, 不包含)
+    NnUint nLayers;         // 层数
+    
+    // 拓扑信息
+    NnUint rootNodeIndex;   // 该 Stage 的 Root 节点全局 ID (用于 Stage 间通信)
+    NnUint nNodes;          // 该 Stage 内的节点数量
+    NnUint *nodeIndices;    // 该 Stage 包含的全局节点 ID 列表
+    
+    // 构造/析构
+    NnStageConfig() : nodeIndices(nullptr) {}
+    ~NnStageConfig() { if (nodeIndices) delete[] nodeIndices; }
+    
+    // 移动构造
+    NnStageConfig(NnStageConfig&& other) noexcept 
+        : stageIndex(other.stageIndex), startLayer(other.startLayer), 
+          endLayer(other.endLayer), nLayers(other.nLayers),
+          rootNodeIndex(other.rootNodeIndex), nNodes(other.nNodes), 
+          nodeIndices(other.nodeIndices) {
+        other.nodeIndices = nullptr;
+    }
+    NnStageConfig(const NnStageConfig&) = delete;
+};
+
+// ======================================================================================
 // Uneven Partition Plan (Memory Safe)
 // ======================================================================================
 
 struct NnUnevenPartitionPlan {
     NnUint nNodes;
+
+    NnUint nStages;
+    NnStageConfig *stages; // Stage 数组
 
     NnDimSplit headSplit;
     NnDimSplit kvHeadSplit;
@@ -70,6 +111,7 @@ struct NnUnevenPartitionPlan {
           dimSplit(other.dimSplit) {
         
         // 剥夺源对象的所有权
+        other.stages = nullptr; // 接管 stages
         zeroSplit(other.headSplit);
         zeroSplit(other.kvHeadSplit);
         zeroSplit(other.vocabSplit);
@@ -226,6 +268,8 @@ enum NnOpCode {
     OP_SHIFT,
     OP_SOFTMAX,
     OP_MOE_GATE,
+    OP_PP_RECV,
+    OP_PP_SEND,
 };
 
 enum NnOpQuantType {
@@ -258,6 +302,8 @@ enum NnSyncType {
     SYNC_WITH_ROOT, // whole pipe to all nodes
     SYNC_NODE_SLICES, // my slice of pipe to all nodes
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
+    SYNC_PP_SEND,                     // PP: 当前 Stage 发送给 Next Stage
+    SYNC_PP_RECV                      // PP: 当前 Stage 从 Prev Stage 接收
 };
 
 enum NnRopeType {
@@ -328,6 +374,7 @@ typedef struct {
     NnBufferConfig *buffers;
     NnUint nSegments;
     NnSegmentConfig *segments;
+    const struct NnUnevenPartitionPlan *partitionPlan = nullptr;
 } NnNodeConfig;
 
 // ======================================================================================
@@ -480,8 +527,7 @@ void fullfillRopeCache(const NnRopeOpConfig *config, float *cache);
 
 // 创建计划 (包含 GQA 对齐修复)
 NnUnevenPartitionPlan createPartitionPlan(
-    NnUint nNodes,
-    const std::vector<float>& ratios,
+    const std::vector<NnStageDef>& stageDefs,
     NnUint globalNHeads,
     NnUint globalNKvHeads,
     NnUint globalVocabSize,

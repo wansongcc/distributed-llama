@@ -4,6 +4,7 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-executor.hpp"
 #include "nn/nn-network-local.hpp"
+#include "nn/nn-network.hpp"
 
 
 enum LlmHeaderKey {
@@ -90,6 +91,7 @@ typedef struct {
     NnUint tokenPipeIndex;
     NnUint xPipeIndex;
     NnUint logitsPipeIndex;
+    NnUint zqPipeIndex;
     NnSize3D tokenEmbeddingSize;
     NnSize3D rmsNormSize;
     NnSize3D qkRmsNormSize;
@@ -140,9 +142,9 @@ typedef struct {
 LlmHeader loadLlmHeader(const char* path, const unsigned int maxSeqLen, NnFloatType syncType);
 void printLlmHeader(LlmHeader *header);
 LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
-LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const std::vector<float>& ratios);
+LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnUnevenPartitionPlan* plan);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
-void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan);
+void loadLlmNetWeightUneven(const char* path, LlmNet *net, NnLocalWeightLoader *loader, const NnUnevenPartitionPlan* plan, NnUint nodeIndex);
 
 #endif

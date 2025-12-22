@@ -31,18 +31,18 @@
       "name": "dllama Inference (ASan)",
       "type": "cppdbg",
       "request": "launch",
-      "program": "/workspace/distributed-llama/dllama",
+      "program": "/workspace/dllama/distributed-llama/dllama",
       "args": [
         "inference",
-        "--prompt", "Hello world",
+        "--prompt", "introduce yourself",
         "--steps", "32",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
         "--tokenizer", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t",
         "--buffer-float-type", "q80",
         "--nthreads", "2",
         "--max-seq-len", "2048",
-        "--workers", "rpi-trixie2:10001",
-        "--ratios", "1.0,3.0"
+        "--workers", "rpi-trixie5:9999",
+        "--ratios", "2.0*1.0"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,

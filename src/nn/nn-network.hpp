@@ -67,7 +67,11 @@ public:
     void writeAll(void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
+    void sendToNode(NnUint targetNodeIndex, const void* data, NnSize size);
+    void recvFromNode(NnUint sourceNodeIndex, void* data, NnSize size);
+    int getSocketIndexForNode(NnUint targetNodeIndex) const;
     void resetStats();
+    
 };
 
 class NnNetworkNodeSynchronizer : public NnNodeSynchronizer {
@@ -77,6 +81,7 @@ private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     const NnUnevenPartitionPlan *plan;
+    const NnStageConfig* myStage = nullptr;
 public:
     NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
     ~NnNetworkNodeSynchronizer() override {};

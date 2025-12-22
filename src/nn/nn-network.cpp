@@ -16,13 +16,14 @@ typedef SSIZE_T ssize_t;
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include <chrono>
 #include <fcntl.h>
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
 
 #define ACK 23571114
-#define MAX_CHUNK_SIZE 4096
+#define MAX_CHUNK_SIZE 65536
 
 static inline bool isEagainError() {
     #ifdef _WIN32
@@ -37,6 +38,15 @@ static NnUint getSplitTotal(const NnDimSplit& split, NnUint nNodes) {
     NnUint sum = 0;
     for(NnUint i=0; i<nNodes; ++i) sum += split.lengths[i];
     return sum;
+}
+
+static NnUint getGroupRootIndex(const NnStageConfig* stage) {
+    if (stage != nullptr) {
+        // 如果是在某个 Stage 内部同步，Root 是该 Stage 的第一个节点
+        return stage->rootNodeIndex; 
+    }
+    // 如果是全局同步，Root 是全局 Node 0
+    return 0;
 }
 
 static inline void setNonBlocking(int socket, bool enabled) {
@@ -630,116 +640,279 @@ void NnNetwork::resetStats() {
     }
 }
 
-static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
-    if (nodeIndex == 0) {
-        // root
+int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex) const {
+// [修复] 针对 1 Root + N Workers 的简单拓扑
+    // Root 节点: Node 1 对应 Socket 0
+    if (targetNodeIndex > 0) {
+        return (int)targetNodeIndex - 1;
+    }
+    // Worker 节点: Target 0 (Root) 对应 Socket 0
+    return 0;
+}
 
-        NnUint nSocketsPerThread = network->nSockets / nThreads + (network->nSockets % nThreads > threadIndex ? 1 : 0);
+void NnNetwork::sendToNode(NnUint targetNodeIndex, const void* data, NnSize size) {
+    // 1. 获取对应的 Socket Index
+    int socketIndex = getSocketIndexForNode(targetNodeIndex);
+    
+    // 2. 这里的 socketIndex 就是 sockets 数组的下标
+    // write 函数内部会查找 this->sockets[socketIndex]
+    write(socketIndex, data, size);
+}
+
+void NnNetwork::recvFromNode(NnUint sourceNodeIndex, void* data, NnSize size) {
+    int socketIndex = getSocketIndexForNode(sourceNodeIndex);
+    read(socketIndex, data, size);
+}
+
+static void syncWithRoot(
+    NnNetwork *network, 
+    NnUint myNodeIndex, 
+    NnByte *buffer, 
+    NnSize nBytes, 
+    NnUint nThreads, 
+    NnUint threadIndex,
+    const NnStageConfig *stage // [新增] 传入 Stage 信息
+) {
+    // 1. 确定谁是 Root
+    NnUint groupRootIndex = getGroupRootIndex(stage); // 复用之前的辅助函数
+    bool amIRoot = (myNodeIndex == groupRootIndex);
+
+    if (amIRoot) {
+        // --- Root 发送 (Broadcast) ---
+        
+        // 确定目标节点列表
+        std::vector<int> targetSockets;
+        if (stage) {
+            // Stage 内广播：只发给组内其他节点
+            for(NnUint i=0; i<stage->nNodes; ++i) {
+                NnUint target = stage->nodeIndices[i];
+                if(target != myNodeIndex) {
+                    int sock = network->getSocketIndexForNode(target);
+                    if(sock >= 0) targetSockets.push_back(sock);
+                }
+            }
+        } else {
+            // 全局广播：发给所有 Socket (简单处理)
+            // 注意：这假设 network->nSockets 包含了所有 Worker
+            for(NnUint i=0; i<network->nSockets; ++i) targetSockets.push_back(i);
+        }
+
+        NnUint nTargets = targetSockets.size();
+        if (nTargets == 0) return;
+
+        // 分配给线程
+        NnUint nSocketsPerThread = nTargets / nThreads + (nTargets % nThreads > threadIndex ? 1 : 0);
         if (nSocketsPerThread == 0) return;
+
+        NnUint startIdx = 0;
+        for (NnUint t = 0; t < threadIndex; ++t) {
+            startIdx += nTargets / nThreads + (nTargets % nThreads > t ? 1 : 0);
+        }
 
         std::vector<NnSocketIo> ios(nSocketsPerThread);
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            ios[i].socketIndex = threadIndex + i * nThreads;
+            ios[i].socketIndex = targetSockets[startIdx + i]; // 使用真实的 Socket Index
             ios[i].data = buffer;
             ios[i].size = nBytes;
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
-    } else {
-        // worker
 
-        if (threadIndex != 0) return;
+    } else {
+        // --- Worker 接收 ---
+
+        if (threadIndex != 0) return; // 接收通常只需要一个线程
+
+        int rootSocketIndex = network->getSocketIndexForNode(groupRootIndex);
+        if (rootSocketIndex < 0) {
+            // 异常：找不到 Root 的连接
+            return; 
+        }
 
         NnSocketIo ios;
         ios.data = buffer;
         ios.size = nBytes;
-        ios.socketIndex = 0; // root
+        ios.socketIndex = rootSocketIndex; // [修正] 使用查找到的 Socket，而不是硬编码 0
         network->readMany(1, &ios);
     }
 }
 
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex, const NnUnevenPartitionPlan *plan) {
-    bool isWorker = nodeIndex != 0;
-    // Determine the number of active sockets involved in this sync
-    // If only sending to root, worker only talks to socket 0.
-    // Otherwise (full sync), everyone talks to everyone.
-    NnUint nSockets = (onlyFromWorkerToRoot && isWorker) ? 1 : network->nSockets;
-    
-    // Calculate how many sockets this specific thread should handle
-    NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
+static void syncNodeSlices(
+    bool onlyFromWorkerToRoot, 
+    NnNetwork *network, 
+    NnUint myNodeIndex, 
+    NnUint nTotalNodes, 
+    NnByte *buffer, 
+    NnSize nBytes, 
+    NnUint nThreads, 
+    NnUint threadIndex, 
+    const NnUnevenPartitionPlan *plan,
+    const NnStageConfig *stage // 指定同步组
+) {
+    // ---------------------------------------------------------
+    // 0. [核心修改] 确定当前组的 Root 身份
+    // ---------------------------------------------------------
+    NnUint groupRootIndex = getGroupRootIndex(stage);
+    bool amIRoot = (myNodeIndex == groupRootIndex);
+
+    // 1. 确定参与同步的节点列表 (Peers)
+    const NnUint* groupNodes = stage ? stage->nodeIndices : nullptr;
+    NnUint nGroupNodes = stage ? stage->nNodes : nTotalNodes;
+
+    // 2. 筛选出需要通信的 Socket
+    std::vector<int> targetSockets;
+    std::vector<NnUint> targetNodeIndices;
+
+    for (NnUint i = 0; i < nGroupNodes; ++i) {
+        // 获取目标的全局 ID
+        NnUint targetNode = groupNodes ? groupNodes[i] : i;
+        
+        // 跳过自己
+        if (targetNode == myNodeIndex) continue;
+
+        // [修改] 动态的 Root/Worker 判定逻辑
+        if (onlyFromWorkerToRoot) {
+            // Case A: 我是 Worker (不是本组 Root)
+            if (!amIRoot) {
+                // Worker 只理会本组的 Root
+                if (targetNode != groupRootIndex) continue; 
+            }
+            // Case B: 我是 Root (本组 Root)
+            else { 
+                // Root 理会所有人 (接收)，这里不需要 continue，
+                // 因为 targetNode 肯定不是我自己(已跳过)，所以是 Worker
+            }
+        }
+
+        int socketIndex = network->getSocketIndexForNode(targetNode);
+        if (socketIndex >= 0) {
+            targetSockets.push_back(socketIndex);
+            targetNodeIndices.push_back(targetNode);
+        }
+    }
+
+    // 3. 任务分配给线程 (保持不变)
+    NnUint nActiveSockets = targetSockets.size();
+    NnUint nSocketsPerThread = nActiveSockets / nThreads + (nActiveSockets % nThreads > threadIndex ? 1 : 0);
     if (nSocketsPerThread == 0) return;
 
-    // [CRITICAL FIX] Calculate exact offsets and sizes for ALL nodes based on the plan
-    // This ensures that Root knows exactly how much data to expect from Worker 1 (e.g. 75% of buffer)
-    // instead of defaulting to 50%.
-    std::vector<NnSize> sliceOffsets(nNodes);
-    std::vector<NnSize> sliceSizes(nNodes);
-    
-    // Use the robust fill function (ensure this function definition is available above)
-    fillUnevenSlices(plan, nNodes, nBytes, sliceOffsets, sliceSizes);
+    NnUint startIdx = 0;
+    for (NnUint t = 0; t < threadIndex; ++t) {
+        startIdx += nActiveSockets / nThreads + (nActiveSockets % nThreads > t ? 1 : 0);
+    }
+
+    // 4. 准备切分信息 (Plan Aware) (保持不变)
+    std::vector<NnSize> sliceOffsets(nTotalNodes);
+    std::vector<NnSize> sliceSizes(nTotalNodes);
+    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes);
 
     std::vector<NnSocketIo> ios(nSocketsPerThread);
 
-    // --- SEND PHASE ---
-    // Rule: Root always sends (in full sync). Worker sends if it's not a "Receive-Only" scenario (which doesn't exist here really)
-    // Actually: 
-    // - SYNC_NODE_SLICES: Everyone sends their slice to everyone.
-    // - SYNC_NODE_SLICES_EXCEPT_ROOT: Workers send to Root. Root does NOT send.
-    
+    // --- 发送阶段 (Send) ---
     bool iShouldSend = true;
-    if (onlyFromWorkerToRoot && !isWorker) iShouldSend = false; // Root doesn't send in EXCEPT_ROOT mode
+    
+    // [修改] 如果我是 Root 且模式是 Worker->Root，我不发送
+    if (onlyFromWorkerToRoot && amIRoot) iShouldSend = false; 
 
     if (iShouldSend) {
-        // I send MY slice (determined by nodeIndex)
-        NnByte *mySliceData = &buffer[sliceOffsets[nodeIndex]];
-        NnSize mySliceSize = sliceSizes[nodeIndex];
+        //  - 此处展示 TP 组内的 Gather 模式
+        // 注意：mySliceData 的偏移量依赖于 fillUnevenSlices 的逻辑
+        // 如果使用了之前讨论的“局部偏移重置”，这里 sliceOffsets[myNodeIndex] 也是正确的
+        NnByte *mySliceData = &buffer[sliceOffsets[myNodeIndex]];
+        NnSize mySliceSize = sliceSizes[myNodeIndex];
 
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            
-            // In "onlyFromWorkerToRoot" mode for a worker, socket 0 connects to Root.
-            // In normal mode, socketIndex corresponds to the connection index.
-            
-            ios[i].socketIndex = socketIndex;
+            NnUint idx = startIdx + i;
+            ios[i].socketIndex = targetSockets[idx];
             ios[i].data = mySliceData;
-            ios[i].size = mySliceSize; // Send the CORRECT uneven size
+            ios[i].size = mySliceSize;
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
     }
 
-    // --- RECEIVE PHASE ---
-    // Rule: Root always receives. Worker receives only in full sync.
+    // --- 接收阶段 (Receive) ---
     bool iShouldRecv = true;
-    if (onlyFromWorkerToRoot && isWorker) iShouldRecv = false; // Worker doesn't recv in EXCEPT_ROOT mode
+    
+    // [修改] 如果我是 Worker 且模式是 Worker->Root，我不接收
+    if (onlyFromWorkerToRoot && !amIRoot) iShouldRecv = false; 
 
     if (iShouldRecv) {
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            
-            // Determine which node is on the other end of this socket
-            // Root's sockets: [0 -> Node1], [1 -> Node2]...
-            // Worker's sockets: [0 -> Root(Node0)], [1 -> Node2]...
-            NnUint targetNodeIndex;
-            if (nodeIndex == 0) {
-                // I am Root. Socket 0 is Node 1.
-                targetNodeIndex = socketIndex + 1;
-            } else {
-                // I am Worker K. 
-                // Socket < K corresponds to Node i (0..K-1)
-                // Socket >= K corresponds to Node i+1 (K+1...N)
-                // (Assuming standard fully connected mesh or star topology logic in distributed-llama)
-                if (socketIndex < nodeIndex) targetNodeIndex = socketIndex;
-                else targetNodeIndex = socketIndex + 1;
-            }
+            NnUint idx = startIdx + i;
+            NnUint targetNode = targetNodeIndices[idx];
 
-            // [CRITICAL] Use the TARGET node's size and offset
-            NnByte *targetSliceData = &buffer[sliceOffsets[targetNodeIndex]];
-            NnSize targetSliceSize = sliceSizes[targetNodeIndex];
-
-            ios[i].socketIndex = socketIndex;
-            ios[i].data = targetSliceData;
-            ios[i].size = targetSliceSize; // Expect the CORRECT uneven size
+            ios[i].socketIndex = targetSockets[idx];
+            ios[i].data = &buffer[sliceOffsets[targetNode]];
+            ios[i].size = sliceSizes[targetNode]; 
         }
         network->readMany(nSocketsPerThread, &ios[0]);
+    }
+}
+
+static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
+                       const NnUnevenPartitionPlan *plan) {
+    // 1. 找到我所在的 Stage
+    const NnStageConfig* myStage = nullptr;
+    const NnStageConfig* nextStage = nullptr;
+    
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        // 检查我是否是该 Stage 的成员
+        for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
+            if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
+                myStage = &plan->stages[s];
+                // 如果还有下一个 Stage
+                if (s + 1 < plan->nStages) {
+                    nextStage = &plan->stages[s+1];
+                }
+                break;
+            }
+        }
+        if (myStage) break;
+    }
+
+    // 2. 只有当前 Stage 的 Root 负责发送
+    if (myStage && myStage->rootNodeIndex == myNodeIndex) {
+        if (nextStage) {
+            // 发送给下一阶段的 Root
+            // printf("🚀 [PP] Node %u sending %zu bytes to Node %u (Stage %u)\n", 
+            //        myNodeIndex, nBytes, nextStage->rootNodeIndex, nextStage->stageIndex);
+            
+            // 注意：这里需要 network 实现点对点 write
+            // 如果网络拓扑不支持直连，可能需要通过 Node 0 中转
+            network->sendToNode(nextStage->rootNodeIndex, buffer, nBytes);
+        }
+    }
+}
+
+static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, NnSize nBytes, 
+                       const NnUnevenPartitionPlan *plan) {
+    const NnStageConfig* myStage = nullptr;
+    const NnStageConfig* prevStage = nullptr;
+
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
+            if (plan->stages[s].nodeIndices[i] == myNodeIndex) {
+                myStage = &plan->stages[s];
+                if (s > 0) {
+                    prevStage = &plan->stages[s-1];
+                }
+                break;
+            }
+        }
+        if (myStage) break;
+    }
+
+    // 只有当前 Stage 的 Root 负责接收
+    if (myStage && myStage->rootNodeIndex == myNodeIndex) {
+        if (prevStage) {
+            // 从上一阶段的 Root 接收
+            // printf("📥 [PP] Node %u receiving %zu bytes from Node %u (Stage %u)\n", 
+            //        myNodeIndex, nBytes, prevStage->rootNodeIndex, prevStage->stageIndex);
+                   
+            network->recvFromNode(prevStage->rootNodeIndex, buffer, nBytes);
+        } else {
+            // 如果是 Stage 0 的第一层，数据应该来自 Embedding/Input，理论上不走 PP_RECV
+            // 除非我们在架构设计上把 Embedding 视为 "Stage -1"
+        }
     }
 }
 
@@ -749,6 +922,19 @@ NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetEx
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
     this->plan = plan;
+    // [新增] 构造时缓存 myStage，避免运行时重复查找
+    this->myStage = nullptr;
+    if (plan) {
+        for (NnUint s = 0; s < plan->nStages; ++s) {
+            for (NnUint i = 0; i < plan->stages[s].nNodes; ++i) {
+                if (plan->stages[s].nodeIndices[i] == nodeConfig->nodeIndex) {
+                    this->myStage = &plan->stages[s];
+                    goto stage_found; // 跳出双层循环
+                }
+            }
+        }
+    }
+stage_found:;
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -760,18 +946,48 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         NnPipeConfig *pipeConfig = &netConfig->pipes[syncConfig->pipeIndex];
         NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
 
+        auto start = std::chrono::high_resolution_clock::now();
+        const char* syncTypeStr = "UNKNOWN";
+
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
-                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
+                syncTypeStr = "SYNC_WITH_ROOT";
+                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan);
+                syncTypeStr = "SYNC_NODE_SLICES";
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan, this->myStage);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan);
-            } else {
+                syncTypeStr = "SYNC_LOGITS";
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan, nullptr);
+            } 
+            else if (syncConfig->syncType == SYNC_PP_SEND) {
+                syncTypeStr = "PP_SEND";
+                // PP 只要单线程执行一次
+                if (threadIndex == 0) {
+                    syncPpSend(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                }
+            }
+            else if (syncConfig->syncType == SYNC_PP_RECV) {
+                syncTypeStr = "PP_RECV";
+                // PP 只要单线程执行一次
+                if (threadIndex == 0) {
+                    syncPpRecv(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, plan);
+                }
+            }else {
                 throw std::invalid_argument("Unknown sync type");
             }
+            if (threadIndex == 0) {
+            auto end = std::chrono::high_resolution_clock::now();
+            double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+            
+            // 阈值过滤：只打印耗时超过 5ms 的操作
+            if (elapsedMs > 5.0) {
+                printf("⏱️ [Sync Debug] Node %u | Seg %u | %s | Pipe %u | Bytes: %llu | Time: %.2f ms\n", 
+                    nodeConfig->nodeIndex, segmentIndex, syncTypeStr, syncConfig->pipeIndex, (unsigned long long)batchBytes, elapsedMs);
+            }
+        }
         }
     }
 }
