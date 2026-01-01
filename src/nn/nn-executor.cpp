@@ -127,7 +127,12 @@ void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnS
             }
         }
     }
-    throw std::invalid_argument("Cannot locate op by name: " + std::string(name));
+    throw std::invalid_argument(
+        "Cannot locate op name='" + std::string(name) +
+        "' index=" + std::to_string(opIndex) +
+        " on node=" + std::to_string(nodeConfig ? nodeConfig->nodeIndex : 0u) +
+        ". (Likely plan/config mismatch between root and worker binaries or --ratios)"
+    );
 }
 
 inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context) {

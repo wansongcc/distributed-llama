@@ -34,15 +34,16 @@
       "program": "/workspace/dllama/distributed-llama/dllama",
       "args": [
         "inference",
-        "--prompt", "introduce yourself",
+        "--prompt", "You are a helpful assistant.introduce yourself",
         "--steps", "32",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
         "--tokenizer", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_tokenizer_qwen3_0.6b_q40.t",
         "--buffer-float-type", "q80",
         "--nthreads", "2",
         "--max-seq-len", "2048",
+        "--benchmark",
         "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie4:9999",
-        "--ratios", "1.0,1.0*1.0,1.0"
+        "--ratios", "1:2*1:1*2:3"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,

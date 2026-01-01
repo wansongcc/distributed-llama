@@ -152,6 +152,21 @@ static void inference(AppInferenceContext *context) {
     NnUint evalTotalTime = 0;
     NnUint predTotalTime = 0;
 
+    // Per-stage/per-node profiling stats (enabled when executor benchmark is on)
+    struct NodePerfAgg {
+        unsigned long long execUs = 0;
+        unsigned long long syncUs = 0;
+        unsigned long long forwardCount = 0;
+        unsigned long long tokenCount = 0;
+        NnUint stageIndex = 0;
+        bool hasStage = false;
+    };
+    const NnUint nNodes = (context->args->nWorkers + 1);
+    std::vector<NodePerfAgg> perfAgg;
+    if (context->args->benchmark) {
+        perfAgg.resize(nNodes);
+    }
+
     int token = inputTokens[pos];
     printf("%s\n", context->args->prompt);
     for (;;) {
@@ -168,6 +183,20 @@ static void inference(AppInferenceContext *context) {
             context->inference->setToken(i, inputTokens[pos + i]);
 
         context->inference->forward();
+
+        if (context->args->benchmark) {
+            const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
+            for (const LlmPerfPacket& p : perf) {
+                if (p.nodeIndex >= perfAgg.size()) continue;
+                NodePerfAgg& a = perfAgg[p.nodeIndex];
+                a.execUs += p.execUs;
+                a.syncUs += p.syncUs;
+                a.forwardCount += 1;
+                a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
+                a.stageIndex = p.stageIndex;
+                a.hasStage = true;
+            }
+        }
         float* logits = context->inference->logitsPipe;
         NnUint vocabSize = context->header->vocabSize;
         bool hasNaN = false;
@@ -230,6 +259,20 @@ static void inference(AppInferenceContext *context) {
         context->inference->setToken(0, token);
         context->inference->forward();
 
+        if (context->args->benchmark) {
+            const std::vector<LlmPerfPacket>& perf = context->inference->getLastPerf();
+            for (const LlmPerfPacket& p : perf) {
+                if (p.nodeIndex >= perfAgg.size()) continue;
+                NodePerfAgg& a = perfAgg[p.nodeIndex];
+                a.execUs += p.execUs;
+                a.syncUs += p.syncUs;
+                a.forwardCount += 1;
+                a.tokenCount += (unsigned long long)std::max<NnUint>(1u, p.batchSize);
+                a.stageIndex = p.stageIndex;
+                a.hasStage = true;
+            }
+        }
+
 #if DLLAMA_DEBUG_TOPK_LOGITS
         // 预测阶段：前若干步打印 topK，快速判断 logits 是否“像正常语言模型”
         if (pos < 16) {
@@ -272,6 +315,37 @@ static void inference(AppInferenceContext *context) {
     printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
         (nPredTokens * 1000) / predTotalTimeMs,
         predTotalTimeMs / ((float) nPredTokens));
+
+    if (context->args->benchmark && !perfAgg.empty()) {
+        printf("\n");
+        printf("⏱️  [Stage/Node Profile Summary]\n");
+        for (NnUint node = 0; node < (NnUint)perfAgg.size(); ++node) {
+            const NodePerfAgg& a = perfAgg[node];
+            if (a.forwardCount == 0 || a.tokenCount == 0) continue;
+
+            const double execPerFwdMs = (double)a.execUs / 1000.0 / (double)a.forwardCount;
+            const double syncPerFwdMs = (double)a.syncUs / 1000.0 / (double)a.forwardCount;
+            const double totalPerFwdMs = execPerFwdMs + syncPerFwdMs;
+
+            const double execPerTokMs = (double)a.execUs / 1000.0 / (double)a.tokenCount;
+            const double syncPerTokMs = (double)a.syncUs / 1000.0 / (double)a.tokenCount;
+            const double totalPerTokMs = execPerTokMs + syncPerTokMs;
+
+            printf("  • Stage %u Node %u: per-fwd total=%6.2f ms (exec=%6.2f sync=%6.2f) | per-tok total=%6.2f ms (exec=%6.2f sync=%6.2f) | fwd=%llu tok=%llu\n",
+                a.hasStage ? a.stageIndex : 0u,
+                node,
+                totalPerFwdMs,
+                execPerFwdMs,
+                syncPerFwdMs,
+                totalPerTokMs,
+                execPerTokMs,
+                syncPerTokMs,
+                (unsigned long long)a.forwardCount,
+                (unsigned long long)a.tokenCount);
+        }
+        printf("\n");
+        printf("Hint: prompt eval uses batchSize>1, so per-token is usually the meaningful metric for rebalancing.\n");
+    }
 }
 
 static NnUint readStdin(const char *guide, char *buffer, NnUint size) {
@@ -430,7 +504,6 @@ int main(int argc, char **argv) {
     try {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
         if (std::strcmp(args.mode, "inference") == 0) {
-            args.benchmark = true;
             printf("nNodes=%d\n", args.nWorkers);
             runInferenceApp(&args, &inference);
         } else if (std::strcmp(args.mode, "perplexity") == 0)

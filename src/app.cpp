@@ -13,6 +13,71 @@
 // 引入 LLM 头文件以获取 createPartitionPlan 等定义
 #include "llm.hpp"
 
+// ---------------------------------------------------------
+// Root control-packet logging (default OFF)
+// Enable with: -DDLLAMA_CONTROL_LOG=1
+// ---------------------------------------------------------
+#ifndef DLLAMA_CONTROL_LOG
+#define DLLAMA_CONTROL_LOG 0
+#endif
+
+static inline void logRootControlSend(const LlmControlPacket& p) {
+#if DLLAMA_CONTROL_LOG
+    // Match worker-side format for easy diff/align.
+    printf("📤 [Root] Send Control: Batch=%u, Pos=%u, Flags=0x%x\n", p.batchSize, p.position, p.flags);
+#else
+    (void)p;
+#endif
+}
+
+static void writeBootstrapPacket(NnNetwork *network, NnUint socketIndex, const AppCliArgs *args) {
+    LlmBootstrapPacket p;
+    p.magic = LLM_BOOTSTRAP_MAGIC;
+    p.version = LLM_BOOTSTRAP_VERSION;
+    p.flags = 0u;
+    p.benchmarkEnabled = args->benchmark ? 1u : 0u;
+    p.maxSeqLen = args->maxSeqLen;
+    p.syncType = (NnUint)args->syncType;
+    p.modelPathLen = 0u;
+    p.ratiosLen = 0u;
+
+    if (args->modelPath != nullptr) {
+        p.flags |= LLM_BOOTSTRAP_HAS_MODEL_PATH;
+        p.modelPathLen = (NnUint)std::strlen(args->modelPath) + 1u;
+    }
+    if (args->ratiosStr != nullptr) {
+        p.flags |= LLM_BOOTSTRAP_HAS_RATIOS;
+        p.ratiosLen = (NnUint)std::strlen(args->ratiosStr) + 1u;
+    }
+
+    network->write(socketIndex, &p, sizeof(p));
+    if (p.modelPathLen > 0u) network->write(socketIndex, args->modelPath, p.modelPathLen);
+    if (p.ratiosLen > 0u) network->write(socketIndex, args->ratiosStr, p.ratiosLen);
+}
+
+static LlmBootstrapPacket readBootstrapPacket(NnNetwork *network, std::string &modelPath, std::string &ratiosStr) {
+    LlmBootstrapPacket p;
+    network->read(ROOT_SOCKET_INDEX, &p, sizeof(p));
+    if (p.magic != LLM_BOOTSTRAP_MAGIC)
+        throw std::runtime_error("Invalid bootstrap magic (root/worker binary mismatch)");
+    if (p.version != LLM_BOOTSTRAP_VERSION)
+        throw std::runtime_error("Unsupported bootstrap version (root/worker binary mismatch)");
+
+    modelPath.clear();
+    ratiosStr.clear();
+    if ((p.flags & LLM_BOOTSTRAP_HAS_MODEL_PATH) != 0u) {
+        std::vector<char> buf(p.modelPathLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.modelPathLen);
+        modelPath.assign(buf.data());
+    }
+    if ((p.flags & LLM_BOOTSTRAP_HAS_RATIOS) != 0u) {
+        std::vector<char> buf(p.ratiosLen);
+        network->read(ROOT_SOCKET_INDEX, buf.data(), p.ratiosLen);
+        ratiosStr.assign(buf.data());
+    }
+    return p;
+}
+
 static NnFloatType parseFloatType(char *val) {
     if (std::strcmp(val, "f32") == 0) return F_32;
     if (std::strcmp(val, "f16") == 0) return F_16;
@@ -46,6 +111,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.temperature = 0.8f;
     args.topp = 0.9f;
     args.steps = 0;
+    args.benchmark = false;
     args.seed = (unsigned long long)time(nullptr);
     args.chatTemplateType = TEMPLATE_UNKNOWN;
     args.maxSeqLen = 0;
@@ -69,21 +135,31 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             return args;
         }
     }
-    for (; i + 1 < argc; i += 2) {
+    // Parse arguments. Some options are flags (no value), others require a value.
+    // NOTE: --workers consumes a variable number of args.
+    for (; i < argc; ) {
         char *name = argv[i];
-        char *value = argv[i + 1];
-        if (std::strcmp(name, "--model") == 0) {
-            args.modelPath = value;
-        } else if (std::strcmp(name, "--tokenizer") == 0) {
-            args.tokenizerPath = value;
-        } else if (std::strcmp(name, "--prompt") == 0) {
-            args.prompt = value;
-        } else if (std::strcmp(name, "--buffer-float-type") == 0) {
-            args.syncType = parseFloatType(value);
-        } else if (std::strcmp(name, "--workers") == 0) {
+
+        // Flags (no value)
+        if (std::strcmp(name, "--benchmark") == 0) {
+            // Support both: "--benchmark" and "--benchmark 1|0".
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                args.benchmark = std::atoi(argv[i + 1]) != 0;
+                i += 2;
+            } else {
+                args.benchmark = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        // Options with special arity
+        if (std::strcmp(name, "--workers") == 0) {
             int j = i + 1;
             for (; j < argc && argv[j][0] != '-'; j++);
             int count = j - i - 1;
+            if (count <= 0)
+                throw std::runtime_error("--workers requires at least one worker in host:port format");
 
             args.nWorkers = count;
             args.workerHosts = new char*[count];
@@ -102,10 +178,25 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
                 args.workerPorts[s] = std::atoi(separator + 1);
             }
 
-            i += count - 1;
-        } else if (strcmp(argv[i], "--ratios") == 0) {
-            if (++i >= argc) throw std::runtime_error("--ratios requires an argument (e.g., \"1.0,3.0\")");
-            args.ratiosStr = argv[i];
+            i = j;
+            continue;
+        }
+
+        // All remaining options require a value
+        if (i + 1 >= argc)
+            throw std::runtime_error(std::string("Missing value for option: ") + name);
+        char *value = argv[i + 1];
+
+        if (std::strcmp(name, "--model") == 0) {
+            args.modelPath = value;
+        } else if (std::strcmp(name, "--tokenizer") == 0) {
+            args.tokenizerPath = value;
+        } else if (std::strcmp(name, "--prompt") == 0) {
+            args.prompt = value;
+        } else if (std::strcmp(name, "--buffer-float-type") == 0) {
+            args.syncType = parseFloatType(value);
+        } else if (std::strcmp(name, "--ratios") == 0) {
+            args.ratiosStr = value;
         } else if (std::strcmp(name, "--port") == 0) {
             args.port = atoi(value);
         } else if (std::strcmp(name, "--nthreads") == 0) {
@@ -135,6 +226,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
+
+        i += 2;
     }
 
     if (args.nThreads < 1)
@@ -184,151 +277,274 @@ static std::vector<float> parseRatios(const char *ratiosStr, NnUint nNodes) {
 static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNodes, NnUint nLayers) {
     printf("🔍 [DEBUG] parseStageDefs received: \"%s\"\n", ratiosStr);
 
-    std::vector<NnStageDef> stages;
-    std::string s(ratiosStr);
+    // ---------------------------------------------------------
+    // Ratios string formats (both supported; auto-detected):
+    //
+    // (A) Legacy per-stage TP ratios (recommended to keep using):
+    //   "tp0*tp1*tp2"  where each tp is node ratios (',' or ':' separated)
+    //   Optional explicit layers:
+    //     - Preferred: append "@<nLayers>" to a stage (works with ':' or ',')
+    //     - Legacy:    append ":<nLayers>" ONLY when ratios use commas (e.g. "1,1:10")
+    //   Examples:
+    //     - 2 nodes, 2 stages: "1*1"
+    //     - 4 nodes, 2 stages: "1,1*1,1" or "1:1*1:1"
+    //     - explicit layers:   "1:1@10*1:1@18" or "1,1:10*1,1:18"
+    //
+    // (B) Two-level ratios (stage weights + per-stage TP ratios):
+    //   "stageWeights*tpStage0*tpStage1*..."
+    //   stageWeights is a list of weights (':' or ',' separated), one per stage.
+    //   Each tpStageK is that stage's intra-TP node ratios (':' or ',' separated).
+    //   Example (your case): stage weights 1:2; stage0 nodes 1:1; stage1 nodes 2:3
+    //     - nNodes=4: "1:2*1:1*2:3"
+    // ---------------------------------------------------------
 
-    // 1) 支持多种 Stage 分隔符：'*'、';'、'|' 均可
-    // 将所有可能的分隔符统一替换为 '*'
-    for (char &c : s) {
-        if (c == ';' || c == '|') c = '*';
-    }
+    auto splitStages = [](const std::string& raw) -> std::vector<std::string> {
+        std::string s2 = raw;
+        for (char &c : s2) {
+            if (c == ';' || c == '|') c = '*';
+        }
+        std::vector<std::string> parts;
+        std::stringstream ss2(s2);
+        std::string seg;
+        while (std::getline(ss2, seg, '*')) {
+            if (!seg.empty()) parts.push_back(seg);
+        }
+        return parts;
+    };
 
-    std::stringstream ss(s);
-    std::string segment;
+    auto isAllDigits = [](const std::string& t) -> bool {
+        if (t.empty()) return false;
+        for (char c : t) {
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
+    };
 
-    NnUint totalExplicitLayers = 0;
-    std::vector<int> autoLayerIndices; // 记录哪些 Stage 需要自动分配
-
-    // 2) 解析每个 Stage
-    while (std::getline(ss, segment, '*')) {
-        if (segment.empty()) continue;
-
-        NnStageDef stage;
-        stage.nLayers = 0; // 0 表示未指定，稍后自动分配
-
-        // 检查冒号 ':' (显式指定层数)
-        size_t colonPos = segment.find(':');
+    // Parse a segment that may be:
+    //  - ratios only: "1,1" or "1:1"
+    //  - ratios + explicit layers (unambiguous): "1:1@10" or "1,1@10"
+    //  - legacy ratios + explicit layers: "1,1:10" (ONLY when ratios use commas)
+    //
+    // NOTE: We intentionally DO NOT interpret a trailing ":<digits>" as layers when
+    // ratios are separated by ':' (e.g. "1:2"), because that would be ambiguous.
+    // Returns {ratios, nLayersExplicit(0 if none)}
+    auto parseRatiosAndMaybeLayers = [&](const std::string& segment) -> std::pair<std::vector<float>, NnUint> {
+        NnUint explicitLayers = 0;
         std::string ratioPart = segment;
 
-        if (colonPos != std::string::npos) {
-            ratioPart = segment.substr(0, colonPos);
-            std::string layerPart = segment.substr(colonPos + 1);
-            try {
-                stage.nLayers = (NnUint)std::stoi(layerPart);
-                totalExplicitLayers += stage.nLayers;
-            } catch (...) {
-                throw std::invalid_argument("Invalid layer count: " + layerPart);
-            }
-        }
-
-        // 解析 TP 比例（逗号分隔）
-        std::stringstream ss2(ratioPart);
-        std::string ratio;
-        while (std::getline(ss2, ratio, ',')) {
-            if (ratio.empty()) continue;
-            try {
-                stage.tpRatios.push_back(std::stof(ratio));
-            } catch (...) {
-                throw std::invalid_argument("Invalid ratio value: " + ratio);
-            }
-        }
-
-        if (stage.tpRatios.empty()) {
-            throw std::invalid_argument("Empty stage definition found");
-        }
-
-        if (stage.nLayers == 0) {
-            autoLayerIndices.push_back((int)stages.size());
-        }
-
-        stages.push_back(stage);
-    }
-
-    // 3. 校验节点总数
-    NnUint totalNodesParsed = 0;
-    for(const auto& stage : stages) {
-        totalNodesParsed += stage.tpRatios.size();
-    }
-    
-    if (totalNodesParsed != nNodes) {
-        // 构造更友好的错误信息，解释 Ratio 语义并给出示例
-        std::stringstream msg;
-        msg << "Ratios defined " << totalNodesParsed
-            << " nodes, but expected " << nNodes << ".\n"
-            << "• Commas (,) define TP nodes inside one stage.\n"
-            << "• Stages are separated by '*', ';' or '|'.\n"
-            << "• Total nodes across ALL stages must equal nNodes (root + workers).\n"
-            << "Examples:\n"
-            << "  - nNodes=2, two stages: \"1.0*1.0\"\n"
-            << "  - nNodes=4, two stages: \"1.0,1.0*1.0,1.0\"\n"
-            << "Hint: adjust --workers or ratio string accordingly.";
-        throw std::invalid_argument(msg.str());
-    }
-
-    // 4. [核心修改] 按权重比例分配层数
-    if (totalExplicitLayers > nLayers) {
-        throw std::invalid_argument("Explicit layers count exceeds total model layers");
-    }
-
-    NnUint remainingLayers = nLayers - totalExplicitLayers;
-    size_t nAutoStages = autoLayerIndices.size();
-
-    if (nAutoStages > 0) {
-        // 计算每个自动分配 Stage 的“总算力权重”
-        std::vector<float> stageWeights;
-        float totalWeight = 0.0f;
-
-        for (int idx : autoLayerIndices) {
-            float w = 0.0f;
-            // Stage 的权重 = 该 Stage 内所有节点的 Ratio 之和
-            // (例如 "0.5,0.5" 的权重是 1.0, "2.0" 的权重是 2.0)
-            for (float r : stages[idx].tpRatios) w += r;
-            stageWeights.push_back(w);
-            totalWeight += w;
-        }
-
-        if (totalWeight <= 1e-6) {
-            // 兜底：如果权重全是 0，退化为平均分配
-            NnUint base = remainingLayers / nAutoStages;
-            NnUint remain = remainingLayers % nAutoStages;
-            for (size_t i = 0; i < nAutoStages; ++i) {
-                stages[autoLayerIndices[i]].nLayers = base + (i < remain ? 1 : 0);
-            }
-        } else {
-            // 按比例分配
-            NnUint allocatedSoFar = 0;
-            for (size_t i = 0; i < nAutoStages; ++i) {
-                int stageIdx = autoLayerIndices[i];
-                NnUint myLayers;
-
-                if (i == nAutoStages - 1) {
-                    // 最后一个 Stage 拿走剩余所有，消除舍入误差
-                    myLayers = remainingLayers - allocatedSoFar;
-                } else {
-                    // 计算比例: (MyWeight / TotalWeight) * Remaining
-                    float ratio = stageWeights[i] / totalWeight;
-                    myLayers = (NnUint)std::round(remainingLayers * ratio);
-                    
-                    // 边界检查：防止溢出或分配为0（除非算力真的极小）
-                    if (allocatedSoFar + myLayers > remainingLayers) {
-                        myLayers = remainingLayers - allocatedSoFar;
+        // Preferred, unambiguous layer syntax: "...@<int>"
+        {
+            const size_t atPos = segment.rfind('@');
+            if (atPos != std::string::npos && atPos + 1 < segment.size()) {
+                const std::string tail = segment.substr(atPos + 1);
+                if (isAllDigits(tail)) {
+                    try {
+                        explicitLayers = (NnUint)std::stoul(tail);
+                        ratioPart = segment.substr(0, atPos);
+                    } catch (...) {
+                        // ignore
+                        explicitLayers = 0;
+                        ratioPart = segment;
                     }
                 }
-                
-                stages[stageIdx].nLayers = myLayers;
-                allocatedSoFar += myLayers;
-                
-                printf("⚖️  [Auto-Split] Stage %d (Weight %.2f): Assigned %u layers\n", 
-                       stageIdx, stageWeights[i], myLayers);
             }
         }
-    } else {
-        if (remainingLayers != 0) {
-            throw std::invalid_argument("Explicit layers sum does not match total model layers");
+
+        // Legacy layer syntax: "1,1:10" (ONLY when ratios use commas)
+        if (explicitLayers == 0u) {
+            const bool hasComma = (segment.find(',') != std::string::npos);
+            if (hasComma) {
+                const size_t lastColon = segment.rfind(':');
+                if (lastColon != std::string::npos && lastColon + 1 < segment.size()) {
+                    const std::string tail = segment.substr(lastColon + 1);
+                    if (isAllDigits(tail)) {
+                        try {
+                            explicitLayers = (NnUint)std::stoul(tail);
+                            ratioPart = segment.substr(0, lastColon);
+                        } catch (...) {
+                            explicitLayers = 0;
+                            ratioPart = segment;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now parse ratios: allow both ',' and ':' as separators.
+        // We normalize ',' to ':' and then split.
+        std::string rp = ratioPart;
+        for (char &c : rp) {
+            if (c == ',') c = ':';
+        }
+        std::vector<float> ratios;
+        std::stringstream ss4(rp);
+        std::string r;
+        while (std::getline(ss4, r, ':')) {
+            if (r.empty()) continue;
+            try {
+                ratios.push_back(std::stof(r));
+            } catch (...) {
+                throw std::invalid_argument("Invalid ratio value: " + r);
+            }
+        }
+        if (ratios.empty()) throw std::invalid_argument("Empty ratio list in segment: " + segment);
+        return {ratios, explicitLayers};
+    };
+
+    auto sumNodeCounts = [](const std::vector<NnStageDef>& st) -> NnUint {
+        NnUint n = 0;
+        for (const auto& s : st) n += (NnUint)s.tpRatios.size();
+        return n;
+    };
+
+    auto autoAssignLayers = [&](std::vector<NnStageDef>& stages, const std::vector<float>& stageWeights) {
+        // Collect explicit layers
+        NnUint totalExplicitLayers = 0;
+        std::vector<int> autoLayerIndices;
+        for (size_t i = 0; i < stages.size(); ++i) {
+            if (stages[i].nLayers == 0) {
+                autoLayerIndices.push_back((int)i);
+            } else {
+                totalExplicitLayers += stages[i].nLayers;
+            }
+        }
+
+        if (totalExplicitLayers > nLayers) {
+            throw std::invalid_argument("Explicit layers count exceeds total model layers");
+        }
+        NnUint remainingLayers = nLayers - totalExplicitLayers;
+
+        if (autoLayerIndices.empty()) {
+            if (remainingLayers != 0) {
+                throw std::invalid_argument("Explicit layers sum does not match total model layers");
+            }
+            return;
+        }
+
+        // Compute weights for auto stages
+        float totalWeight = 0.0f;
+        std::vector<float> w;
+        w.reserve(autoLayerIndices.size());
+        for (int idx : autoLayerIndices) {
+            float ww = (idx >= 0 && (size_t)idx < stageWeights.size()) ? stageWeights[(size_t)idx] : 0.0f;
+            w.push_back(ww);
+            totalWeight += ww;
+        }
+
+        if (totalWeight <= 1e-6f) {
+            // Fallback: uniform
+            NnUint base = remainingLayers / (NnUint)autoLayerIndices.size();
+            NnUint rem = remainingLayers % (NnUint)autoLayerIndices.size();
+            for (size_t i = 0; i < autoLayerIndices.size(); ++i) {
+                stages[(size_t)autoLayerIndices[i]].nLayers = base + (i < rem ? 1u : 0u);
+            }
+            return;
+        }
+
+        // Proportional with rounding (last stage gets the remainder)
+        NnUint allocatedSoFar = 0;
+        for (size_t i = 0; i < autoLayerIndices.size(); ++i) {
+            int stageIdx = autoLayerIndices[i];
+            NnUint myLayers = 0;
+            if (i + 1 == autoLayerIndices.size()) {
+                myLayers = remainingLayers - allocatedSoFar;
+            } else {
+                float ratio = w[i] / totalWeight;
+                myLayers = (NnUint)std::round(remainingLayers * ratio);
+                if (allocatedSoFar + myLayers > remainingLayers) myLayers = remainingLayers - allocatedSoFar;
+            }
+            stages[(size_t)stageIdx].nLayers = myLayers;
+            allocatedSoFar += myLayers;
+            printf("⚖️  [Auto-Split] Stage %d (Weight %.2f): Assigned %u layers\n", stageIdx, w[i], myLayers);
+        }
+    };
+
+    // ---------- Pass 0: tokenize stage segments ----------
+    const std::vector<std::string> parts = splitStages(std::string(ratiosStr));
+    if (parts.empty()) throw std::invalid_argument("Ratios string is empty");
+
+    // ---------- Pass 1: try legacy parsing ----------
+    {
+        std::vector<NnStageDef> stages;
+        stages.reserve(parts.size());
+        for (const auto& seg : parts) {
+            NnStageDef st;
+            st.nLayers = 0;
+            auto parsed = parseRatiosAndMaybeLayers(seg);
+            st.tpRatios = std::move(parsed.first);
+            st.nLayers = parsed.second;
+            stages.push_back(std::move(st));
+        }
+
+        const NnUint totalNodesParsed = sumNodeCounts(stages);
+        if (totalNodesParsed == nNodes) {
+            // Legacy semantics: stage weight derived from sum(tpRatios)
+            std::vector<float> stageWeights;
+            stageWeights.reserve(stages.size());
+            for (const auto& st : stages) {
+                float w = 0.0f;
+                for (float r : st.tpRatios) w += r;
+                stageWeights.push_back(w);
+            }
+            autoAssignLayers(stages, stageWeights);
+            return stages;
         }
     }
-    
-    return stages;
+
+    // ---------- Pass 2: two-level parsing (stageWeights + per-stage tp) ----------
+    {
+        if (parts.size() < 2) {
+            throw std::invalid_argument("Invalid ratios format: not enough segments");
+        }
+
+        // First segment = stage weights
+        std::vector<float> stageWeights;
+        {
+            auto parsed = parseRatiosAndMaybeLayers(parts[0]);
+            if (parsed.second != 0u) {
+                throw std::invalid_argument("Stage-weights segment must not specify layers: " + parts[0]);
+            }
+            stageWeights = std::move(parsed.first);
+        }
+
+        const size_t nStages = stageWeights.size();
+        if (nStages == 0) throw std::invalid_argument("Stage weights cannot be empty");
+        if (parts.size() != 1 + nStages) {
+            std::stringstream msg;
+            msg << "Two-level ratios expects 1+" << nStages
+                << " segments, but got " << parts.size() << ".\n"
+                << "Format: stageWeights*tpStage0*tpStage1*...\n"
+            	<< "Example: \"1:2*1:1*2:3\"\n"
+                << "Optional explicit layers: tpStage0@10 (e.g. \"1:2*1:1@10*2:3@18\")";
+            throw std::invalid_argument(msg.str());
+        }
+
+        std::vector<NnStageDef> stages;
+        stages.reserve(nStages);
+        for (size_t i = 0; i < nStages; ++i) {
+            const std::string& seg = parts[1 + i];
+            NnStageDef st;
+            st.nLayers = 0;
+            auto parsed = parseRatiosAndMaybeLayers(seg);
+            st.tpRatios = std::move(parsed.first);
+            st.nLayers = parsed.second;
+            stages.push_back(std::move(st));
+        }
+
+        const NnUint totalNodesParsed = sumNodeCounts(stages);
+        if (totalNodesParsed != nNodes) {
+            std::stringstream msg;
+            msg << "Ratios defined " << totalNodesParsed
+                << " nodes, but expected " << nNodes << ".\n"
+                << "Two-level format example (nNodes=4): \"1:2*1:1*2:3\"\n"
+                << "(Stage weights 1:2; stage0 nodes 1:1; stage1 nodes 2:3)\n"
+                << "Note: use '@<layers>' if you need explicit layer counts (e.g. \"1:2*1:1@10*2:3@18\").";
+            throw std::invalid_argument(msg.str());
+        }
+
+        autoAssignLayers(stages, stageWeights);
+        return stages;
+    }
 }
 
 void printPartitionPlanDebug(const NnUnevenPartitionPlan* plan) {
@@ -391,14 +607,28 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     return devices;
 }
 
-RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network) {
+static NnUint getStageIndexForNode(const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    if (plan == nullptr || plan->nStages == 0) return 0;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig* st = &plan->stages[s];
+        for (NnUint i = 0; i < st->nNodes; ++i) {
+            if (st->nodeIndices[i] == nodeIndex) return st->stageIndex;
+        }
+    }
+    return 0;
+}
+
+RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnUnevenPartitionPlan* plan, bool profileEnabled) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
     this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
     this->logitsPipe = (float *)execution->pipes[net->logitsPipeIndex];
     this->execution = execution;
     this->executor = executor;
-    this->network = network; // May be nullptr!
+    this->network = network;
+    this->plan = plan;
+    this->profileEnabled = profileEnabled;
+    this->controlPacket.flags = profileEnabled ? LLM_CTRL_PROFILE : 0u;
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -421,14 +651,53 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 }
 
 void RootLlmInference::forward() {
-    if (network != nullptr) 
+    if (network != nullptr) {
+        logRootControlSend(controlPacket);
         network->writeAll(&controlPacket, sizeof(LlmControlPacket));
+    }
     executor->forward();
+
+    if (!profileEnabled) return;
+
+    // Collect per-node timings for this forward() call.
+    lastPerf.clear();
+    lastPerf.reserve((network != nullptr ? network->nSockets : 0u) + 1u);
+
+    // Root node (node 0)
+    {
+        LlmPerfPacket p;
+        p.position = controlPacket.position;
+        p.batchSize = controlPacket.batchSize;
+        p.nodeIndex = 0;
+        p.stageIndex = getStageIndexForNode(plan, 0);
+        p.execUs = executor->getTotalTime(STEP_EXECUTE_OP);
+        p.syncUs = executor->getTotalTime(STEP_SYNC_NODES);
+        lastPerf.push_back(p);
+    }
+
+    // Worker nodes
+    if (network != nullptr && network->nSockets > 0) {
+        const NnUint nWorkers = network->nSockets;
+        const size_t base = lastPerf.size();
+        lastPerf.resize(base + nWorkers);
+
+        std::vector<NnSocketIo> ios(nWorkers);
+        for (NnUint i = 0; i < nWorkers; ++i) {
+            ios[i].socketIndex = i;
+            ios[i].data = &lastPerf[base + i];
+            ios[i].size = sizeof(LlmPerfPacket);
+        }
+        network->readMany(nWorkers, &ios[0]);
+    }
 }
 
 void RootLlmInference::finish() {
     if (network != nullptr) {
         controlPacket.batchSize = 0;
+        // Stop packet: position is not meaningful when batchSize==0.
+        // Set to 0 to avoid confusing logs / downstream checks.
+        controlPacket.position = 0;
+        logRootControlSend(controlPacket);
         network->writeAll(&controlPacket, sizeof(LlmControlPacket));
     }
 }
@@ -444,12 +713,13 @@ bool WorkerLlmInference::tryReadControlPacket() {
     const unsigned long maxAttempts = 10000;
     if (!network->tryReadWithMaxAttempts(ROOT_SOCKET_INDEX, &controlPacket, sizeof(LlmControlPacket), maxAttempts))
         return false;
-    printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);    
     if (controlPacket.batchSize == 0) {
-        printf("🛑 Stop signal\n");
+        // Stop packet: position is ignored by design.
+        printf("📨 [Worker] Recv Control: Batch=0 (stop)\n");
         isFinished = true;
         return true;
     }
+    printf("📨 [Worker] Recv Control: Batch=%u, Pos=%u\n", controlPacket.batchSize, controlPacket.position);
     for (NnUint i = 0; i < controlPacket.batchSize; i++)
         positionPipe[i] = (float)(controlPacket.position + i);
     execution->setBatchSize(controlPacket.batchSize);
@@ -515,6 +785,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     } else {
         networkPtr = NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts);
         network = networkPtr.get();
+
+        // Bootstrap: send modelPath/ratios/maxSeqLen/syncType to workers so they don't need CLI args.
+        for (NnUint nodeIndex = 1; nodeIndex < nNodes; ++nodeIndex) {
+            const NnUint socketIndex = nodeIndex - 1;
+            writeBootstrapPacket(network, socketIndex, args);
+        }
+
         // 初始化 Synchronizer (传入 Plan)
         synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, planPtr.get()));
 
@@ -523,7 +800,8 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     }
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution, planPtr.get());
-    NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
+    const bool profileEnabled = args->benchmark;
+    NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), profileEnabled);
 
     // Load weights
     if (args->ratiosStr != nullptr) {
@@ -541,7 +819,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         loadLlmNetWeight(args->modelPath, &net, &weightLoader);
     }
 
-    RootLlmInference inference(&net, &execution, &executor, network);
+    RootLlmInference inference(&net, &execution, &executor, network, planPtr.get(), profileEnabled);
 
     if (network != nullptr) {
         network->resetStats();
@@ -570,6 +848,18 @@ void runWorkerApp(AppCliArgs *args) {
         std::unique_ptr<NnNetwork> networkPtr = NnNetwork::serve(args->port);
         NnNetwork *network = networkPtr.get();
 
+        // Read bootstrap settings from root.
+        std::string bootModelPath;
+        std::string bootRatios;
+        LlmBootstrapPacket boot = readBootstrapPacket(network, bootModelPath, bootRatios);
+
+        const bool hasBootModel = !bootModelPath.empty();
+        const bool hasBootRatios = !bootRatios.empty();
+        const bool useLocalLoading = hasBootModel && hasBootRatios;
+        const NnUint bootMaxSeqLen = boot.maxSeqLen;
+        const NnFloatType bootSyncType = (NnFloatType)boot.syncType;
+        const bool bootBenchmarkEnabled = boot.benchmarkEnabled != 0u;
+
         NnWorkerConfigReader configReader(network);
         NnNetConfig netConfig = configReader.readNet();
         NnNodeConfig nodeConfig = configReader.readNode();
@@ -581,19 +871,19 @@ void runWorkerApp(AppCliArgs *args) {
 
         NnNetExecution execution(args->nThreads, &netConfig);
 
-        // 1. Initialize Plan Pointer (Worker Side)
-        std::unique_ptr<NnUnevenPartitionPlan> planPtr;
+           // 1. Initialize Plan Pointer (Worker Side)
+           std::unique_ptr<NnUnevenPartitionPlan> planPtr;
         
-        if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
-             // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
-             LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+           if (useLocalLoading) {
+               // Worker 需要重新加载 Header 和 Plan 以确定加载逻辑和切分
+               LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
              
              // [兼容性修复] 自动切换 Q80
              if (header.weightType == F_Q40 && header.syncType != F_Q80) {
                  header.syncType = F_Q80;
              }
 
-             std::vector<NnStageDef> stageDefs = parseStageDefs(args->ratiosStr, netConfig.nNodes, header.nLayers);
+               std::vector<NnStageDef> stageDefs = parseStageDefs(bootRatios.c_str(), netConfig.nNodes, header.nLayers);
              NnUint ffDim = (header.archType == QWEN3_MOE) ? header.moeHiddenDim : header.hiddenDim;
              
 
@@ -607,14 +897,17 @@ void runWorkerApp(AppCliArgs *args) {
         // Initialize Synchronizer with Plan
         NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, planPtr.get());
         
-        NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
+        // Benchmark flag is provided by root to keep all nodes consistent.
+        // Worker CLI --benchmark is no longer required.
+        const bool profileEnabled = bootBenchmarkEnabled;
+        NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, profileEnabled);
 
-        if (args->ratiosStr != nullptr && args->modelPath != nullptr) {
+        if (useLocalLoading) {
             // [Local Loading Mode]
-            printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, args->modelPath);
+            printf("🚀 Worker %d: Local Loading Mode from %s\n", nodeConfig.nodeIndex, bootModelPath.c_str());
             
             // Reload header for temporary network construction
-            LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
+            LlmHeader header = loadLlmHeader((char*)bootModelPath.c_str(), bootMaxSeqLen, bootSyncType);
             
             // Build temporary Net for loading context
             // 这里我们需要构建一个临时的 LlmNet 结构，因为 loader 需要 net 指针
@@ -625,7 +918,7 @@ void runWorkerApp(AppCliArgs *args) {
             NnLocalWeightLoader localLoader(&executor, nodeConfig.nodeIndex);
             
             // 使用新版 5 参数加载函数
-            loadLlmNetWeightUneven(args->modelPath, &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
+            loadLlmNetWeightUneven((char*)bootModelPath.c_str(), &tempNet, &localLoader, planPtr.get(), nodeConfig.nodeIndex);
 
             releaseLlmNet(&tempNet);
             printf("✅ Worker %d: Weights loaded locally.\n", nodeConfig.nodeIndex);
@@ -665,6 +958,21 @@ void runWorkerApp(AppCliArgs *args) {
                     printf("🚁 Network is in non-blocking mode\n");
                 }
                 executor.forward();
+
+                // Send per-forward profile packet to root (optional)
+                // IMPORTANT: root will block waiting for these packets when profiling is enabled.
+                // So workers must reply whenever the control packet requests profiling,
+                // even if the worker binary was started without --benchmark (times may be 0).
+                if ((inference.flags() & LLM_CTRL_PROFILE) != 0u) {
+                    LlmPerfPacket p;
+                    p.position = inference.position();
+                    p.batchSize = inference.batchSize();
+                    p.nodeIndex = nodeConfig.nodeIndex;
+                    p.stageIndex = getStageIndexForNode(planPtr.get(), nodeConfig.nodeIndex);
+                    p.execUs = executor.getTotalTime(STEP_EXECUTE_OP);
+                    p.syncUs = executor.getTotalTime(STEP_SYNC_NODES);
+                    network->write(ROOT_SOCKET_INDEX, &p, sizeof(LlmPerfPacket));
+                }
                 isFirstAttempt = true;
             } catch (const NnTransferSocketException &e) {
                 printf("🚨 Network error: %s\n", e.what());

@@ -804,10 +804,11 @@ static inline void fullfillRopeLlamaCache(const NnRopeOpConfig *config, float *c
     assert((config->slice.qDimEnd - config->slice.kvDimStart) % 2 == 0);
 
     const bool applyScaling = config->ropeScalingFactor != 1.0f;
+    float theta = 1000000.0f;
     for (NnUint pos = 0; pos < config->slice.seqLen; pos++) {
         for (NnUint i = config->slice.kvDimStart; i < config->slice.qDimEnd; i += 2) {
             const NnUint h = i % config->slice.headDim;
-            float freq = 1.0f / powf(config->slice.ropeTheta, h / (float)config->slice.headDim);
+            float freq = 1.0f / powf(theta, h / (float)config->slice.headDim);
             if (applyScaling)
                 freq = scaleFrequencyLlama3(freq, config);
             const float val = pos * freq;

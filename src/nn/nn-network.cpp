@@ -151,6 +151,7 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
                              const NnStageConfig* stageForSplit,
                              NnUint totalElements = 0) {
     bool matchFound = false;
+    bool stackedByNode = false;
 
     // Default to zeros for nodes not in stageForSplit
     for (NnUint i = 0; i < nNodes; ++i) {
@@ -159,9 +160,38 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
     }
 
     if (plan && plan->nNodes == nNodes) {
+        // ----------------------------------------------------
+        // [PP Fix] ZQ 等“按 node 堆叠”的 pipe：totalElements == dim * nNodes
+        // 对这种 pipe，slice 应该按【全局 nodeIndex】映射到固定 slot：
+        //   offset = nodeIndex * (totalBytes / nNodes)
+        //   size   = totalBytes / nNodes
+        // 不能用 dim/head split 去匹配，否则会把布局解释错。
+        // ----------------------------------------------------
+        if (stageForSplit != nullptr && plan->nStages > 0 && totalElements > 0) {
+            NnUint dimTotal = getSplitTotalForStageNodes(plan->dimSplit, stageForSplit, nNodes);
+            if (dimTotal > 0 && totalElements == dimTotal * nNodes) {
+                stackedByNode = true;
+            }
+        }
+
+        if (stackedByNode) {
+            if (totalBytes % nNodes != 0) {
+                // Should not happen, but keep safe fallback.
+            } else {
+                NnSize slotBytes = totalBytes / nNodes;
+                for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                    NnUint node = stageForSplit->nodeIndices[k];
+                    offsets[node] = (NnSize)node * slotBytes;
+                    sizes[node] = slotBytes;
+                }
+                matchFound = true;
+            }
+        }
+
         // Helper lambda to check if a specific split configuration matches the current buffer size
         auto tryMatch = [&](const NnDimSplit& split, bool allowMultiplier, const char* name) -> bool {
             (void)name;
+            if (stackedByNode) return false;
             // In PP mode, the split arrays are stage-local but stored across all nodes.
             // So we must compute totals only for the relevant stage.
             NnUint totalUnits = getSplitTotalForStageNodes(split, stageForSplit, nNodes);
@@ -240,19 +270,29 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
     // Fallback: Uniform partitioning
     if (!matchFound) {
         if (stageForSplit) {
-            NnUint m = stageForSplit->nNodes;
-            if (m == 0) return;
-            NnSize avgBytes = totalBytes / m;
-            NnSize currentOffset = 0;
-            for (NnUint k = 0; k < m; ++k) {
-                NnUint node = stageForSplit->nodeIndices[k];
-                offsets[node] = currentOffset;
-                if (k + 1 == m) {
-                    sizes[node] = totalBytes - currentOffset;
-                } else {
-                    sizes[node] = avgBytes;
+            // In PP mode, prefer global node slots when possible (e.g., ZQ-like pipes).
+            if (totalBytes % nNodes == 0) {
+                NnSize slotBytes = totalBytes / nNodes;
+                for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                    NnUint node = stageForSplit->nodeIndices[k];
+                    offsets[node] = (NnSize)node * slotBytes;
+                    sizes[node] = slotBytes;
                 }
-                currentOffset += sizes[node];
+            } else {
+                NnUint m = stageForSplit->nNodes;
+                if (m == 0) return;
+                NnSize avgBytes = totalBytes / m;
+                NnSize currentOffset = 0;
+                for (NnUint k = 0; k < m; ++k) {
+                    NnUint node = stageForSplit->nodeIndices[k];
+                    offsets[node] = currentOffset;
+                    if (k + 1 == m) {
+                        sizes[node] = totalBytes - currentOffset;
+                    } else {
+                        sizes[node] = avgBytes;
+                    }
+                    currentOffset += sizes[node];
+                }
             }
         } else {
             NnSize avgBytes = totalBytes / nNodes;

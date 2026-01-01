@@ -1,6 +1,10 @@
 CXX = g++
 CXXFLAGS = -std=c++11 -Werror -Wformat -Werror=format-security -Isrc
 
+# Optional debug toggles (default OFF)
+DLLAMA_CONTROL_LOG ?= 0
+CXXFLAGS += -DDLLAMA_CONTROL_LOG=$(DLLAMA_CONTROL_LOG)
+
 ifndef TERMUX_VERSION
 	CXXFLAGS += -march=native -mtune=native
 endif

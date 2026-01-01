@@ -256,16 +256,33 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
             NnUint myOffset = 0;
             NnUint myLength = 0;
             bool splitFound = false;
+            bool stackedByNode = false;
 
             // 1. 尝试查阅 Partition Plan 来获取精确的非均匀 Offset/Length
             if (partitionPlan != nullptr && netConfig->nNodes == partitionPlan->nNodes) {
                 NnUint totalDim = sourceSize->x; // 管道的总维度
                 NnUint nodeIdx = nodeConfig->nodeIndex;
                 const NnStageConfig* myStage = (partitionPlan->nStages > 0) ? findStageForNode(partitionPlan, nodeIdx) : nullptr;
+
+                // ----------------------------------------------------
+                // [PP Fix] ZQ 等“按 node 堆叠”的 pipe：总维度 == dim * nNodes
+                // 这种 pipe 的每个 node slice 应该是固定长度 dim，且按【全局 nodeIndex】排布。
+                // 不能用 dim/head split 进行匹配，否则会把 offset 解释成 interleaved 布局，导致跨 stage 污染。
+                // ----------------------------------------------------
+                if (partitionPlan->nStages > 0 && myStage != nullptr) {
+                    NnUint dimTotal = getSplitTotalForStage(&partitionPlan->dimSplit, myStage);
+                    if (dimTotal > 0 && totalDim == dimTotal * netConfig->nNodes) {
+                        stackedByNode = true;
+                    }
+                }
                 
                 // Lambda: 检查给定的 split 是否匹配当前维度
                 auto tryApplySplit = [&](const NnDimSplit& split, bool allowMultiplier, const char* name) -> bool {
                     (void)name;
+                    if (stackedByNode) {
+                        // 对于 stacked-by-node 的 pipe，不允许用任何 split 匹配。
+                        return false;
+                    }
                     // In PP mode, split arrays are stage-local but stored in a single [nNodes] table.
                     // Summing across all nodes would produce (dim * nStages) and fail matching.
                     // So for PP, compute totals only within my stage.
@@ -301,16 +318,23 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
 
             // 2. 如果没有 Plan 或没找到匹配，回退到 Legacy 均匀切分
             if (!splitFound) {
-                // In PP mode, fall back to uniform split within my stage (not global nNodes).
+                // In PP mode:
+                // - If pipe is stacked-by-node (e.g., ZQ = dim * nNodes), use global node slots.
+                // - Otherwise, fall back to uniform split within my stage.
                 const NnStageConfig* myStage = (partitionPlan && partitionPlan->nStages > 0)
                     ? findStageForNode(partitionPlan, nodeConfig->nodeIndex)
                     : nullptr;
 
-                NnUint nSplitNodes = (myStage != nullptr) ? myStage->nNodes : netConfig->nNodes;
-                NnUint rank = (myStage != nullptr) ? findStageRank(myStage, nodeConfig->nodeIndex) : nodeConfig->nodeIndex;
+                if (stackedByNode) {
+                    myLength = sourceSize->x / netConfig->nNodes;
+                    myOffset = myLength * nodeConfig->nodeIndex;
+                } else {
+                    NnUint nSplitNodes = (myStage != nullptr) ? myStage->nNodes : netConfig->nNodes;
+                    NnUint rank = (myStage != nullptr) ? findStageRank(myStage, nodeConfig->nodeIndex) : nodeConfig->nodeIndex;
 
-                myLength = sourceSize->x / nSplitNodes;
-                myOffset = myLength * rank;
+                    myLength = sourceSize->x / nSplitNodes;
+                    myOffset = myLength * rank;
+                }
             }
 
             // 3. 应用偏移量 (带越界保护)
