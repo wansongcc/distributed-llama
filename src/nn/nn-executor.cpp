@@ -73,14 +73,20 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
 
         NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
         if (segmentConfig->nOps > 0) {
+            printf("🔧 [DEBUG] Creating Segment %u ...\n", segmentIndex);
             NnDeviceSegment *segment = device->createSegment(segmentIndex);
             segments[segmentIndex] = std::unique_ptr<NnDeviceSegment>(segment);
 
-            for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++)
+            for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
+                printf("  🔨 [DEBUG] Adding Step: Segment %u, Op %u (%s)\n", segmentIndex, opIndex, segmentConfig->ops[opIndex].name);
                 steps.push_back(NnExecutorStep{ STEP_EXECUTE_OP, segment, opIndex, &segmentConfig->ops[opIndex] });
+            }
         }
-        if (useSynchronizer && segmentConfig->nSyncs > 0)
+        if (useSynchronizer && segmentConfig->nSyncs > 0){
+            printf("  📡 [DEBUG] Adding Step: Segment %u, Sync Nodes (%u syncs)\n", segmentIndex, segmentConfig->nSyncs);
             steps.push_back(NnExecutorStep{ STEP_SYNC_NODES, nullptr, segmentIndex, nullptr });
+        }
+
     }
 
     steps.shrink_to_fit();
@@ -121,7 +127,12 @@ void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnS
             }
         }
     }
-    throw std::invalid_argument("Cannot locate op by name: " + std::string(name));
+    throw std::invalid_argument(
+        "Cannot locate op name='" + std::string(name) +
+        "' index=" + std::to_string(opIndex) +
+        " on node=" + std::to_string(nodeConfig ? nodeConfig->nodeIndex : 0u) +
+        ". (Likely plan/config mismatch between root and worker binaries or --ratios)"
+    );
 }
 
 inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context) {

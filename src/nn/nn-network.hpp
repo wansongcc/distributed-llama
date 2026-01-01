@@ -2,6 +2,7 @@
 #define NN_NETWORK_H
 
 #include "nn-executor.hpp"
+#include "nn-core.hpp"
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -66,7 +67,11 @@ public:
     void writeAll(void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
+    void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
+    void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
+    int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const;
     void resetStats();
+    
 };
 
 class NnNetworkNodeSynchronizer : public NnNodeSynchronizer {
@@ -75,8 +80,10 @@ private:
     NnNetExecution *execution;
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
+    const NnUnevenPartitionPlan *plan;
+    const NnStageConfig* myStage = nullptr;
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, const NnUnevenPartitionPlan *plan = nullptr);
     ~NnNetworkNodeSynchronizer() override {};
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
 };

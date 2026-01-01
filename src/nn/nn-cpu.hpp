@@ -4,6 +4,7 @@
 #include <vector>
 #include "nn-executor.hpp"
 #include "nn-cpu-ops.hpp"
+#include "nn-core.hpp"
 
 #define DEBUG_USE_MMAP_FOR_WEIGHTS false
 
@@ -14,10 +15,11 @@ private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     NnNetExecution *netExecution;
+    const NnUnevenPartitionPlan *partitionPlan;
     NnUint nBuffers;
     NnByte *bufferFlags;
 public:
-    NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution);
+    NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan = nullptr);
     ~NnCpuDevice() override;
     NnUint maxNThreads() override;
     NnDeviceSegment *createSegment(NnUint segmentIndex) override;

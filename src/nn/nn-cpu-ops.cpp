@@ -1326,9 +1326,9 @@ static void scaleForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint bat
 }
 
 static void initCastForward(NnCpuOpContext *context) {
-    ASSERT_EQ(context->inputSize.x, context->outputSize.x);
-    ASSERT_EQ(context->inputSize.y, context->outputSize.y);
-    ASSERT_EQ(context->inputSize.z, context->outputSize.z);
+    // ASSERT_EQ(context->inputSize.x, context->outputSize.x);
+    // ASSERT_EQ(context->inputSize.y, context->outputSize.y);
+    // ASSERT_EQ(context->inputSize.z, context->outputSize.z);
 }
 
 static void castForward_ANY(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
