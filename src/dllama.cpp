@@ -10,6 +10,103 @@
 #include "app.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
+
+#ifndef DLLAMA_DEBUG_TOPK_LOGITS
+#define DLLAMA_DEBUG_TOPK_LOGITS 0
+#endif
+
+#if DLLAMA_DEBUG_TOPK_LOGITS
+static void printEscapedPiece(const char* s, size_t maxLen = 32) {
+    if (s == nullptr) {
+        printf("~");
+        return;
+    }
+    for (size_t i = 0; s[i] != '\0' && i < maxLen; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\n') { printf("\\n"); continue; }
+        if (c == '\r') { printf("\\r"); continue; }
+        if (c == '\t') { printf("\\t"); continue; }
+        if (c < 32 || c >= 127) {
+            printf("\\x%02x", (unsigned)c);
+            continue;
+        }
+        putchar((int)c);
+    }
+}
+
+static void debugTopKLogits(const AppInferenceContext* context, const float* logits, NnUint vocabSize, int k, const char* tag) {
+    if (context == nullptr || context->tokenizer == nullptr || context->tokenizer->vocab == nullptr) return;
+    if (k <= 0) return;
+    if ((NnUint)k > vocabSize) k = (int)vocabSize;
+
+    struct Item { float v; int i; };
+    std::vector<Item> top;
+    top.reserve((size_t)k);
+
+    for (NnUint i = 0; i < vocabSize; ++i) {
+        float v = logits[i];
+        if ((int)top.size() < k) {
+            top.push_back(Item{v, (int)i});
+            if ((int)top.size() == k) {
+                std::sort(top.begin(), top.end(), [](const Item& a, const Item& b) { return a.v > b.v; });
+            }
+            continue;
+        }
+        if (v <= top.back().v) continue;
+        int lo = 0;
+        int hi = k;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (v > top[mid].v) hi = mid; else lo = mid + 1;
+        }
+        for (int j = k - 1; j > lo; --j) top[j] = top[j - 1];
+        top[lo] = Item{v, (int)i};
+    }
+
+    printf("🧭 [TopK] %s k=%d\n", tag == nullptr ? "" : tag, k);
+    for (int j = 0; j < (int)top.size(); ++j) {
+        int id = top[j].i;
+        const char* piece = (id >= 0 && (NnUint)id < context->tokenizer->vocabSize) ? context->tokenizer->vocab[id] : nullptr;
+        printf("  #%d id=%d logit=%+.4f piece=\"", j, id, top[j].v);
+        printEscapedPiece(piece);
+        printf("\"\n");
+    }
+}
+
+static void debugVocabCoverage(const float* logits, NnUint vocabSize, const char* tag) {
+    if (logits == nullptr || vocabSize == 0) return;
+    const int blocks = 16;
+    NnUint blockSize = (vocabSize + blocks - 1) / blocks;
+    NnUint zeroCount = 0;
+    NnUint nearZeroCount = 0;
+    for (NnUint i = 0; i < vocabSize; ++i) {
+        float v = logits[i];
+        if (v == 0.0f) zeroCount++;
+        if (std::fabs(v) < 1e-6f) nearZeroCount++;
+    }
+    printf("🧱 [VocabCoverage] %s vocab=%u zero=%u (%.1f%%) | |v|<1e-6=%u (%.1f%%)\n",
+        tag == nullptr ? "" : tag,
+        vocabSize,
+        zeroCount,
+        vocabSize ? (100.0f * (float)zeroCount / (float)vocabSize) : 0.0f,
+        nearZeroCount,
+        vocabSize ? (100.0f * (float)nearZeroCount / (float)vocabSize) : 0.0f);
+
+    for (int b = 0; b < blocks; ++b) {
+        NnUint lo = (NnUint)b * blockSize;
+        NnUint hi = std::min(vocabSize, lo + blockSize);
+        if (lo >= hi) break;
+        float mx = -1e30f;
+        int mxIdx = -1;
+        for (NnUint i = lo; i < hi; ++i) {
+            float v = logits[i];
+            if (v > mx) { mx = v; mxIdx = (int)i; }
+        }
+        printf("  block[%2d] [%6u..%6u) max=%+.4f idx=%d\n", b, lo, hi, mx, mxIdx);
+    }
+}
+#endif
 
 static void inference(AppInferenceContext *context) {
     if (context->args->prompt == nullptr)
@@ -23,6 +120,27 @@ static void inference(AppInferenceContext *context) {
     NnUint pos = 0;
     int nInputTokens;
     context->tokenizer->encode(context->args->prompt, inputTokens, &nInputTokens, true, true);
+
+#if DLLAMA_DEBUG_TOPK_LOGITS
+    if (context->tokenizer->vocabSize != context->header->vocabSize) {
+        printf("⚠️ Tokenizer vocabSize=%u != Model vocabSize=%u (强烈怀疑 tokenizer/model 不匹配)\n",
+            context->tokenizer->vocabSize,
+            context->header->vocabSize);
+    }
+    {
+        int dumpN = std::min(nInputTokens, 32);
+        printf("🧾 Prompt tokens n=%d: ", nInputTokens);
+        for (int i = 0; i < dumpN; ++i) {
+            int id = inputTokens[i];
+            const char* piece = (id >= 0 && (NnUint)id < context->tokenizer->vocabSize) ? context->tokenizer->vocab[id] : nullptr;
+            printf("%d(\"", id);
+            printEscapedPiece(piece, 16);
+            printf("\")%s", (i + 1 < dumpN) ? " " : "");
+        }
+        if (dumpN < nInputTokens) printf(" ...");
+        printf("\n");
+    }
+#endif
 
     if (nInputTokens > context->header->seqLen)
         throw std::runtime_error("The number of prompt tokens is greater than the sequence length");
@@ -67,9 +185,18 @@ static void inference(AppInferenceContext *context) {
             if (val < minLogit) minLogit = val;
         }
 
+#if DLLAMA_DEBUG_TOPK_LOGITS
+        // 只在 eval 阶段前几步打印，避免刷屏
+        if (pos < 4) {
+            debugTopKLogits(context, logits, vocabSize, 10, "eval");
+            debugVocabCoverage(logits, vocabSize, "eval");
+        }
+#endif
+
 
         pos += batchSize;
-        token = inputTokens[pos + 1];
+        // 注意：这里是在“评估 prompt（不含最后一个 token）”的循环中，不能用 pos+1，
+        // 否则在 pos==nInputTokens-1 时会越界，导致后续生成从错误 token 开始。
 
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
@@ -89,6 +216,9 @@ static void inference(AppInferenceContext *context) {
         evalTotalTime += evalTime + syncTime;
     }
 
+    // 生成阶段的起始 token 应该是 prompt 的最后一个 token（位置为 nInputTokens-1）
+    token = inputTokens[nInputTokens - 1];
+
     fflush(stdout);
 
     context->inference->setBatchSize(1);
@@ -99,6 +229,14 @@ static void inference(AppInferenceContext *context) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
         context->inference->forward();
+
+#if DLLAMA_DEBUG_TOPK_LOGITS
+        // 预测阶段：前若干步打印 topK，快速判断 logits 是否“像正常语言模型”
+        if (pos < 16) {
+            debugTopKLogits(context, context->inference->logitsPipe, context->header->vocabSize, 10, "pred");
+            if (pos < 4) debugVocabCoverage(context->inference->logitsPipe, context->header->vocabSize, "pred");
+        }
+#endif
         token = context->sampler->sample(context->inference->logitsPipe);
 
         char *piece = context->tokenizer->decode(token);
@@ -224,7 +362,8 @@ static void chat(AppInferenceContext *context) {
         context->tokenizer->encode((char*)inputPrompt.content, inputTokens, &nInputTokens, isStart, true);
 
         NnUint userPromptEndPos = (NnUint)std::min<unsigned int>(seqLen, pos + nInputTokens - 1);
-        for (NnUint i = 0; ;) {
+        NnUint i = 0;
+        for (;;) {
             int remainingTokens = userPromptEndPos - pos;
             if (remainingTokens <= 0)
                 break;
@@ -241,8 +380,13 @@ static void chat(AppInferenceContext *context) {
 
             i += batchSize;
             pos += batchSize;
-            token = inputTokens[i + 1];
+            // 这里同 inference()：prompt eval 只跑到最后一个 token 的前一位，
+            // 循环结束后再用 i 指向的那个“最后 token”启动生成。
         }
+
+        // 生成阶段起始 token：prompt 的最后一个 token
+        if (i < (NnUint)nInputTokens) token = inputTokens[i];
+        else token = inputTokens[nInputTokens - 1];
 
         context->inference->setBatchSize(1);
         context->tokenizer->resetDecoder();

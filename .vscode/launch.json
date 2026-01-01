@@ -41,8 +41,8 @@
         "--buffer-float-type", "q80",
         "--nthreads", "2",
         "--max-seq-len", "2048",
-        "--workers", "rpi-trixie5:9999",
-        "--ratios", "2.0*1.0"
+        "--workers", "rpi-trixie5:9999", "rpi-trixie2:9999", "rpi-trixie4:9999",
+        "--ratios", "1.0,1.0*1.0,1.0"
       ],
       "cwd": "/workspace/distributed-llama",
       "stopAtEntry": true,
@@ -88,7 +88,7 @@
         "worker",
         "--port", "9999",
         "--model", "/workspace/distributed-llama/models/qwen3_0.6b_q40/dllama_model_qwen3_0.6b_q40.m",
-        "--ratios", "1.0,3.0"
+        "--ratios", "1.0,1.0*1.0,1.0"
     ],
     "cwd": "/workspace/distributed-llama",
     "stopAtEntry": true,

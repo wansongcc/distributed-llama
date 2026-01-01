@@ -32,15 +32,15 @@ void NnLocalWeightLoader::finish() {
 }
 
 NnSize NnLocalWeightLoader::loadRoot(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
-    // 仅 Root (Node 0) 加载 Embedding
-    if (myNodeIndex == 0) {
-        executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
-    }
+    // [Fix] Allow any node in the first stage to load embedding, not just Node 0
+    // printf("DEBUG: loadRoot op=%s node=%d size=%lu\n", opName, myNodeIndex, nBytes);
+    executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
     return nBytes;
 }
 
 NnSize NnLocalWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
     // 所有节点都加载完整的权重 (e.g., Norms)
+    // printf("DEBUG: loadAll op=%s node=%d size=%lu\n", opName, myNodeIndex, nBytes);
     executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
     return nBytes;
 }
@@ -75,6 +75,7 @@ NnSize NnLocalWeightLoader::loadRowMatmulSlicesUneven(const char *opName, const 
 
     // 3. 直接加载 (Zero-Copy)
     // weight 是当前 Tensor 的全局起始位置，weight + fileByteOffset 是本节点数据的起始位置
+    // printf("DEBUG: loadRowMatmulSlicesUneven op=%s node=%d offset=%lu size=%lu\n", opName, myNodeIndex, fileByteOffset, slice.sliceSize.nBytes);
     executor->loadWeight(opName, opIndex, deviceOffset, slice.sliceSize.nBytes, weight + fileByteOffset);
 
     // 4. 关键：返回 Tensor 的【全局大小】，让主循环的 b 指针正确跳过整个 Tensor

@@ -135,25 +135,89 @@ static NnUint getUnevenSliceOffset(const NnUnevenPartitionPlan *plan, NnUint tot
     return (totalSize / plan->nNodes) * nodeIndex;
 }
 
+static NnUint getSplitTotalForStageNodes(const NnDimSplit& split, const NnStageConfig* stage, NnUint nNodes) {
+    if (!split.lengths) return 0;
+    if (!stage) return getSplitTotal(split, nNodes);
+    NnUint sum = 0;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        sum += split.lengths[stage->nodeIndices[i]];
+    }
+    return sum;
+}
+
 static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, NnSize totalBytes, 
-                             std::vector<NnSize>& offsets, std::vector<NnSize>& sizes) {
+                             std::vector<NnSize>& offsets, std::vector<NnSize>& sizes,
+                             NnFloatType floatType,
+                             const NnStageConfig* stageForSplit,
+                             NnUint totalElements = 0) {
     bool matchFound = false;
+
+    // Default to zeros for nodes not in stageForSplit
+    for (NnUint i = 0; i < nNodes; ++i) {
+        offsets[i] = 0;
+        sizes[i] = 0;
+    }
 
     if (plan && plan->nNodes == nNodes) {
         // Helper lambda to check if a specific split configuration matches the current buffer size
-        auto tryMatch = [&](const NnDimSplit& split) -> bool {
-            NnUint totalUnits = getSplitTotal(split, nNodes);
+        auto tryMatch = [&](const NnDimSplit& split, bool allowMultiplier, const char* name) -> bool {
+            (void)name;
+            // In PP mode, the split arrays are stage-local but stored across all nodes.
+            // So we must compute totals only for the relevant stage.
+            NnUint totalUnits = getSplitTotalForStageNodes(split, stageForSplit, nNodes);
+            
+            // [Fix] Priority: Match by Element Count first (if provided)
+            if (totalElements > 0) {
+                if (totalUnits > 0 && totalElements % totalUnits == 0) {
+                    // Found match by elements!
+                    NnUint multiplier = totalElements / totalUnits; // e.g. HeadDim
+
+                    // [Fix] Prevent aggressive matching for ZQ pipe (dim * nNodes)
+                    if (!allowMultiplier && multiplier != 1u) return false;
+
+                    if (stageForSplit) {
+                        for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                            NnUint node = stageForSplit->nodeIndices[k];
+                            NnUint offElems = split.starts[node] * multiplier;
+                            NnUint lenElems = split.lengths[node] * multiplier;
+                            offsets[node] = getBytes(floatType, offElems);
+                            sizes[node] = getBytes(floatType, lenElems);
+                        }
+                    } else {
+                        for (NnUint node = 0; node < nNodes; ++node) {
+                            NnUint offElems = split.starts[node] * multiplier;
+                            NnUint lenElems = split.lengths[node] * multiplier;
+                            offsets[node] = getBytes(floatType, offElems);
+                            sizes[node] = getBytes(floatType, lenElems);
+                        }
+                    }
+                    return true;
+                }
+            }
+
+            // Fallback: Match by Byte Count (Original Logic)
             // Check if totalBytes is exactly divisible by the total units (e.g. total heads)
-            // This is a heuristic: if we have 152k bytes and 152k vocab, it matches.
             if (totalUnits > 0 && totalBytes % totalUnits == 0) {
-                NnSize bytesPerUnit = totalBytes / totalUnits;
+                // If we are here, totalElements was 0 or didn't match.
+                // If allowMultiplier is false, we should probably also enforce strict matching?
+                // But byte matching is ambiguous. Let's assume if totalElements is not provided,
+                // we rely on byte matching which implies multiplier=1 usually (unless bytes per unit is large).
+                // For safety, let's skip this check if allowMultiplier is false and we suspect a multiplier.
+                // But we don't know the multiplier here.
                 
-                NnSize currentOffset = 0;
-                for (NnUint i = 0; i < nNodes; ++i) {
-                    NnSize len = split.lengths[i] * bytesPerUnit;
-                    offsets[i] = currentOffset; // Recalculate offset to be safe
-                    sizes[i] = len;
-                    currentOffset += len;
+                NnSize bytesPerUnit = totalBytes / totalUnits;
+
+                if (stageForSplit) {
+                    for (NnUint k = 0; k < stageForSplit->nNodes; ++k) {
+                        NnUint node = stageForSplit->nodeIndices[k];
+                        offsets[node] = (NnSize)split.starts[node] * bytesPerUnit;
+                        sizes[node] = (NnSize)split.lengths[node] * bytesPerUnit;
+                    }
+                } else {
+                    for (NnUint node = 0; node < nNodes; ++node) {
+                        offsets[node] = (NnSize)split.starts[node] * bytesPerUnit;
+                        sizes[node] = (NnSize)split.lengths[node] * bytesPerUnit;
+                    }
                 }
                 return true;
             }
@@ -162,31 +226,83 @@ static void fillUnevenSlices(const NnUnevenPartitionPlan *plan, NnUint nNodes, N
 
         // Priority order for matching:
         // 1. Vocab (Logits) - Largest, usually most critical for the "degeneration" bug
-        if (!matchFound) matchFound = tryMatch(plan->vocabSplit);
+        if (!matchFound) matchFound = tryMatch(plan->vocabSplit, false, "vocab");
         // 2. FFN - Intermediate layers
-        if (!matchFound) matchFound = tryMatch(plan->ffnSplit);
+        if (!matchFound) matchFound = tryMatch(plan->ffnSplit, false, "ffn");
         // 3. Dim - General dimension splits
-        if (!matchFound) matchFound = tryMatch(plan->dimSplit);
+        if (!matchFound) matchFound = tryMatch(plan->dimSplit, false, "dim");
         // 4. Heads - Attention Q
-        if (!matchFound) matchFound = tryMatch(plan->headSplit);
+        if (!matchFound) matchFound = tryMatch(plan->headSplit, true, "head");
         // 5. KV Heads - Attention K/V
-        if (!matchFound) matchFound = tryMatch(plan->kvHeadSplit);
+        if (!matchFound) matchFound = tryMatch(plan->kvHeadSplit, true, "kvhead");
     }
 
     // Fallback: Uniform partitioning
     if (!matchFound) {
-        NnSize avgBytes = totalBytes / nNodes;
-        for (NnUint i = 0; i < nNodes; ++i) {
-            sizes[i] = avgBytes;
-            offsets[i] = i * avgBytes;
+        if (stageForSplit) {
+            NnUint m = stageForSplit->nNodes;
+            if (m == 0) return;
+            NnSize avgBytes = totalBytes / m;
+            NnSize currentOffset = 0;
+            for (NnUint k = 0; k < m; ++k) {
+                NnUint node = stageForSplit->nodeIndices[k];
+                offsets[node] = currentOffset;
+                if (k + 1 == m) {
+                    sizes[node] = totalBytes - currentOffset;
+                } else {
+                    sizes[node] = avgBytes;
+                }
+                currentOffset += sizes[node];
+            }
+        } else {
+            NnSize avgBytes = totalBytes / nNodes;
+            for (NnUint i = 0; i < nNodes; ++i) {
+                sizes[i] = avgBytes;
+                offsets[i] = i * avgBytes;
+            }
+            // Fix rounding error for the last node
+            offsets[nNodes - 1] = (nNodes - 1) * avgBytes;
+            sizes[nNodes - 1] = totalBytes - offsets[nNodes - 1];
         }
-        // Fix rounding error for the last node
-        offsets[nNodes - 1] = (nNodes - 1) * avgBytes;
-        sizes[nNodes - 1] = totalBytes - offsets[nNodes - 1];
     }
 }
 
+// ---------------------------------------------------------
+// 通信数据打印开关（载荷字节/哈希/同步诊断）
+// 默认关闭：避免刷屏并减少性能影响。
+// 如需开启：编译时增加 -DNN_NETWORK_COMM_DATA_LOG=1
+// ---------------------------------------------------------
+#ifndef NN_NETWORK_COMM_DATA_LOG
+#define NN_NETWORK_COMM_DATA_LOG 0
+#endif
+
+static void printBytes(const char* prefix, const void* data, NnSize size) {
+#if NN_NETWORK_COMM_DATA_LOG
+    const unsigned char* bytes = (const unsigned char*)data;
+    printf("%s size=%zu bytes=", prefix, size);
+    for (size_t i = 0; i < std::min((size_t)size, (size_t)16); ++i) {
+        printf("%02x ", bytes[i]);
+    }
+    printf("\n");
+#else
+    (void)prefix;
+    (void)data;
+    (void)size;
+#endif
+}
+
+[[maybe_unused]] static inline std::uint64_t fnv1a64(const void* data, NnSize size) {
+    const std::uint8_t* p = (const std::uint8_t*)data;
+    std::uint64_t h = 1469598103934665603ull;
+    for (NnSize i = 0; i < size; ++i) {
+        h ^= (std::uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 void writeSocket(int socket, const void *data, NnSize size) {
+    printBytes("DEBUG: writeSocket", data, size);
     while (size > 0) {
         ssize_t s = send(socket, (const char*)data, size, 0);
         if (s < 0) {
@@ -221,6 +337,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         } else if (r == 0) {
             throw NnTransferSocketException(0, "Socket closed");
         }
+        printBytes("DEBUG: readSocket", data, r);
         data = (char*)data + r;
         s -= r;
     }
@@ -640,28 +757,38 @@ void NnNetwork::resetStats() {
     }
 }
 
-int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex) const {
-// [修复] 针对 1 Root + N Workers 的简单拓扑
-    // Root 节点: Node 1 对应 Socket 0
-    if (targetNodeIndex > 0) {
+int NnNetwork::getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const {
+    // 假设网络是全连接 Mesh，sockets 数组按 Node ID 排序 (跳过自己)
+    if (targetNodeIndex < myNodeIndex) {
+        return (int)targetNodeIndex;
+    }
+    if (targetNodeIndex > myNodeIndex) {
         return (int)targetNodeIndex - 1;
     }
-    // Worker 节点: Target 0 (Root) 对应 Socket 0
-    return 0;
+    return -1; // Should not happen (target == self)
 }
 
-void NnNetwork::sendToNode(NnUint targetNodeIndex, const void* data, NnSize size) {
+void NnNetwork::sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size) {
     // 1. 获取对应的 Socket Index
-    int socketIndex = getSocketIndexForNode(targetNodeIndex);
+    int socketIndex = getSocketIndexForNode(targetNodeIndex, myNodeIndex);
     
     // 2. 这里的 socketIndex 就是 sockets 数组的下标
     // write 函数内部会查找 this->sockets[socketIndex]
-    write(socketIndex, data, size);
+    if (socketIndex >= 0) {
+        write(socketIndex, data, size);
+    } else {
+        // Error or Self
+        printf("❌ Error: sendToNode target=%u my=%u invalid socket index\n", targetNodeIndex, myNodeIndex);
+    }
 }
 
-void NnNetwork::recvFromNode(NnUint sourceNodeIndex, void* data, NnSize size) {
-    int socketIndex = getSocketIndexForNode(sourceNodeIndex);
-    read(socketIndex, data, size);
+void NnNetwork::recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size) {
+    int socketIndex = getSocketIndexForNode(sourceNodeIndex, myNodeIndex);
+    if (socketIndex >= 0) {
+        read(socketIndex, data, size);
+    } else {
+        printf("❌ Error: recvFromNode source=%u my=%u invalid socket index\n", sourceNodeIndex, myNodeIndex);
+    }
 }
 
 static void syncWithRoot(
@@ -676,7 +803,7 @@ static void syncWithRoot(
     // 1. 确定谁是 Root
     NnUint groupRootIndex = getGroupRootIndex(stage); // 复用之前的辅助函数
     bool amIRoot = (myNodeIndex == groupRootIndex);
-
+    
     if (amIRoot) {
         // --- Root 发送 (Broadcast) ---
         
@@ -687,7 +814,7 @@ static void syncWithRoot(
             for(NnUint i=0; i<stage->nNodes; ++i) {
                 NnUint target = stage->nodeIndices[i];
                 if(target != myNodeIndex) {
-                    int sock = network->getSocketIndexForNode(target);
+                    int sock = network->getSocketIndexForNode(target, myNodeIndex);
                     if(sock >= 0) targetSockets.push_back(sock);
                 }
             }
@@ -717,12 +844,18 @@ static void syncWithRoot(
         }
         network->writeMany(nSocketsPerThread, &ios[0]);
 
+        // [新增] Root 等待 Workers 确认 (ACK)
+        // 确保 Workers 已经接收完数据，实现同步屏障
+        for (NnUint i = 0; i < nSocketsPerThread; i++) {
+            network->readAck(ios[i].socketIndex);
+        }
+
     } else {
         // --- Worker 接收 ---
 
         if (threadIndex != 0) return; // 接收通常只需要一个线程
 
-        int rootSocketIndex = network->getSocketIndexForNode(groupRootIndex);
+        int rootSocketIndex = network->getSocketIndexForNode(groupRootIndex, myNodeIndex);
         if (rootSocketIndex < 0) {
             // 异常：找不到 Root 的连接
             return; 
@@ -733,6 +866,9 @@ static void syncWithRoot(
         ios.size = nBytes;
         ios.socketIndex = rootSocketIndex; // [修正] 使用查找到的 Socket，而不是硬编码 0
         network->readMany(1, &ios);
+
+        // [新增] Worker 发送确认 (ACK) 给 Root
+        network->writeAck(rootSocketIndex);
     }
 }
 
@@ -743,10 +879,12 @@ static void syncNodeSlices(
     NnUint nTotalNodes, 
     NnByte *buffer, 
     NnSize nBytes, 
+    NnFloatType floatType,
     NnUint nThreads, 
     NnUint threadIndex, 
     const NnUnevenPartitionPlan *plan,
-    const NnStageConfig *stage // 指定同步组
+    const NnStageConfig *stage, // 指定同步组
+    NnUint totalElements = 0 // [New] Total elements for Q80 matching
 ) {
     // ---------------------------------------------------------
     // 0. [核心修改] 确定当前组的 Root 身份
@@ -771,19 +909,46 @@ static void syncNodeSlices(
 
         // [修改] 动态的 Root/Worker 判定逻辑
         if (onlyFromWorkerToRoot) {
+            // 检查是否是 Logits 收集 (Global gather with PP plan)
+            // 如果是，只有 Last Stage 的节点需要发送给 Root
+            bool isLogitsGather = (plan != nullptr && plan->nStages > 0 && stage == nullptr);
+
             // Case A: 我是 Worker (不是本组 Root)
             if (!amIRoot) {
                 // Worker 只理会本组的 Root
                 if (targetNode != groupRootIndex) continue; 
+
+                if (isLogitsGather) {
+                    const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+                    bool amInLastStage = false;
+                    for(unsigned k=0; k<lastStage.nNodes; ++k) {
+                        if (lastStage.nodeIndices[k] == myNodeIndex) {
+                            amInLastStage = true;
+                            break;
+                        }
+                    }
+                    if (!amInLastStage) continue;
+                }
             }
             // Case B: 我是 Root (本组 Root)
             else { 
-                // Root 理会所有人 (接收)，这里不需要 continue，
-                // 因为 targetNode 肯定不是我自己(已跳过)，所以是 Worker
+                // Root 理会所有人 (接收)
+                // 但如果是 Logits 收集，Root 只接收 Last Stage 的数据
+                if (isLogitsGather) {
+                    const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+                    bool targetInLastStage = false;
+                    for(unsigned k=0; k<lastStage.nNodes; ++k) {
+                        if (lastStage.nodeIndices[k] == targetNode) {
+                            targetInLastStage = true;
+                            break;
+                        }
+                    }
+                    if (!targetInLastStage) continue;
+                }
             }
         }
 
-        int socketIndex = network->getSocketIndexForNode(targetNode);
+        int socketIndex = network->getSocketIndexForNode(targetNode, myNodeIndex);
         if (socketIndex >= 0) {
             targetSockets.push_back(socketIndex);
             targetNodeIndices.push_back(targetNode);
@@ -803,7 +968,48 @@ static void syncNodeSlices(
     // 4. 准备切分信息 (Plan Aware) (保持不变)
     std::vector<NnSize> sliceOffsets(nTotalNodes);
     std::vector<NnSize> sliceSizes(nTotalNodes);
-    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes);
+    
+    // For PP, split tables are stage-local. For logits gather, slices come from the LAST stage.
+    const bool isLogitsGather = (onlyFromWorkerToRoot && plan != nullptr && plan->nStages > 0 && stage == nullptr);
+    const NnStageConfig* stageForSplit = stage;
+    if (isLogitsGather) {
+        stageForSplit = &plan->stages[plan->nStages - 1];
+    }
+
+    // [Fix] Pass floatType + total elements for accurate matching (incl. Q80)
+    fillUnevenSlices(plan, nTotalNodes, nBytes, sliceOffsets, sliceSizes, floatType, stageForSplit, totalElements);
+
+
+
+    // --- logits gather (LastStage -> Root) 调试：打印 Root 端的目标节点与切片信息 ---
+#if NN_NETWORK_COMM_DATA_LOG
+    if (onlyFromWorkerToRoot && amIRoot && plan != nullptr && plan->nStages > 0 && stage == nullptr && threadIndex == 0) {
+        const NnStageConfig& lastStage = plan->stages[plan->nStages - 1];
+        printf("LOGITS GATHER root=%u lastStageNodes=", myNodeIndex);
+        for (unsigned k = 0; k < lastStage.nNodes; ++k) {
+            printf("%u%s", lastStage.nodeIndices[k], (k + 1 < lastStage.nNodes) ? "," : "");
+        }
+        printf(" targetsBuilt=");
+        for (size_t k = 0; k < targetNodeIndices.size(); ++k) {
+            printf("%u%s", targetNodeIndices[k], (k + 1 < targetNodeIndices.size()) ? "," : "");
+        }
+        printf(" nTargets=%zu\n", targetNodeIndices.size());
+
+        for (unsigned k = 0; k < lastStage.nNodes; ++k) {
+            NnUint node = lastStage.nodeIndices[k];
+            if (node == myNodeIndex) continue;
+            int sock = network->getSocketIndexForNode(node, myNodeIndex);
+            printf(
+                "LOGITS GATHER root recv-candidate node=%u sock=%d off=%zu size=%zu\n",
+                node,
+                sock,
+                (size_t)sliceOffsets[node],
+                (size_t)sliceSizes[node]
+            );
+        }
+    }
+#endif
+
 
     std::vector<NnSocketIo> ios(nSocketsPerThread);
 
@@ -813,12 +1019,37 @@ static void syncNodeSlices(
     // [修改] 如果我是 Root 且模式是 Worker->Root，我不发送
     if (onlyFromWorkerToRoot && amIRoot) iShouldSend = false; 
 
+    // logits gather（LastStage -> Root）：发送端应发送自己在 pipe 中写入的那段（全局 offset 语义）。
+    // 早期为了绕开 split 匹配失败导致的“写入在 0，但按全局 offset 读”而临时使用过 LOCAL0。
+    // 现在 split 已 stage-aware 修复后，应回到全局 offset，否则 offset!=0 的 shard 会发送未写入区域（全 0）。
+    // NOTE: isLogitsGather already computed above for stage-aware slicing.
+
     if (iShouldSend) {
         //  - 此处展示 TP 组内的 Gather 模式
         // 注意：mySliceData 的偏移量依赖于 fillUnevenSlices 的逻辑
         // 如果使用了之前讨论的“局部偏移重置”，这里 sliceOffsets[myNodeIndex] 也是正确的
-        NnByte *mySliceData = &buffer[sliceOffsets[myNodeIndex]];
+        NnSize mySliceOffset = sliceOffsets[myNodeIndex];
+        NnByte *mySliceData = &buffer[mySliceOffset];
         NnSize mySliceSize = sliceSizes[myNodeIndex];
+
+        // 通信预览（载荷字节/哈希）：默认关闭
+#if NN_NETWORK_COMM_DATA_LOG
+        if (threadIndex == 0 && mySliceSize > 0) {
+            // logits gather 时尽量打印全量 peer，避免因 preview 截断误判“没收到某个节点”
+            NnUint preview = isLogitsGather ? nSocketsPerThread : std::min(nSocketsPerThread, (NnUint)2);
+            for (NnUint i = 0; i < preview; i++) {
+                NnUint idx = startIdx + i;
+                char prefix[128];
+                std::snprintf(prefix, sizeof(prefix), "SYNC send node %u -> %u bytes=%zu off=%zu mode=%s", myNodeIndex, targetNodeIndices[idx], (size_t)mySliceSize, (size_t)mySliceOffset, "GLOBALOFF");
+                printBytes(prefix, mySliceData, mySliceSize);
+
+                // hash 校验（限制最多 64KB，避免太慢）
+                const NnSize hashLen = std::min(mySliceSize, (NnSize)65536);
+                std::uint64_t h = fnv1a64(mySliceData, hashLen);
+                printf("SYNC send hash node %u -> %u len=%zu hash=0x%016llx\n", myNodeIndex, targetNodeIndices[idx], (size_t)hashLen, (unsigned long long)h);
+            }
+        }
+#endif
 
         for (NnUint i = 0; i < nSocketsPerThread; i++) {
             NnUint idx = startIdx + i;
@@ -845,6 +1076,40 @@ static void syncNodeSlices(
             ios[i].size = sliceSizes[targetNode]; 
         }
         network->readMany(nSocketsPerThread, &ios[0]);
+
+        // 通信预览（载荷字节/哈希）：默认关闭
+#if NN_NETWORK_COMM_DATA_LOG
+        // 注意：在 logits gather 模式下，目标 socket 会被分配到多个线程；只在 threadIndex==0 打印会“看起来缺节点”。
+        if (isLogitsGather || threadIndex == 0) {
+            NnUint preview = isLogitsGather ? nSocketsPerThread : std::min(nSocketsPerThread, (NnUint)2);
+            for (NnUint i = 0; i < preview; i++) {
+                NnUint idx = startIdx + i;
+                NnUint targetNode = targetNodeIndices[idx];
+                NnSize sliceSize = sliceSizes[targetNode];
+                if (sliceSize == 0) {
+                    if (isLogitsGather) {
+                        printf("SYNC recv(t=%u) node %u <- %u skip size=0\n", threadIndex, myNodeIndex, targetNode);
+                    }
+                    continue;
+                }
+                char prefix[160];
+                std::snprintf(prefix, sizeof(prefix), "SYNC recv(t=%u) node %u <- %u bytes=%zu", threadIndex, myNodeIndex, targetNode, (size_t)sliceSize);
+                printBytes(prefix, &buffer[sliceOffsets[targetNode]], sliceSize);
+
+                // hash 校验（限制最多 64KB，避免太慢）
+                const NnSize hashLen = std::min(sliceSize, (NnSize)65536);
+                std::uint64_t h = fnv1a64(&buffer[sliceOffsets[targetNode]], hashLen);
+                printf(
+                    "SYNC recv hash(t=%u) node %u <- %u len=%zu hash=0x%016llx\n",
+                    threadIndex,
+                    myNodeIndex,
+                    targetNode,
+                    (size_t)hashLen,
+                    (unsigned long long)h
+                );
+            }
+        }
+#endif
     }
 }
 
@@ -878,7 +1143,7 @@ static void syncPpSend(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
             
             // 注意：这里需要 network 实现点对点 write
             // 如果网络拓扑不支持直连，可能需要通过 Node 0 中转
-            network->sendToNode(nextStage->rootNodeIndex, buffer, nBytes);
+            network->sendToNode(nextStage->rootNodeIndex, myNodeIndex, buffer, nBytes);
         }
     }
 }
@@ -908,7 +1173,7 @@ static void syncPpRecv(NnNetwork *network, NnUint myNodeIndex, NnByte *buffer, N
             // printf("📥 [PP] Node %u receiving %zu bytes from Node %u (Stage %u)\n", 
             //        myNodeIndex, nBytes, prevStage->rootNodeIndex, prevStage->stageIndex);
                    
-            network->recvFromNode(prevStage->rootNodeIndex, buffer, nBytes);
+            network->recvFromNode(prevStage->rootNodeIndex, myNodeIndex, buffer, nBytes);
         } else {
             // 如果是 Stage 0 的第一层，数据应该来自 Embedding/Input，理论上不走 PP_RECV
             // 除非我们在架构设计上把 Embedding 视为 "Stage -1"
@@ -945,6 +1210,14 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         NnByte *pipe = execution->pipes[syncConfig->pipeIndex];
         NnPipeConfig *pipeConfig = &netConfig->pipes[syncConfig->pipeIndex];
         NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
+        NnUint totalElements = pipeConfig->size.x; // [New] Get total elements
+
+        // (Debug) Uncomment if you need per-sync pipe size info
+        // if (threadIndex == 0) {
+        //     printf("DEBUG sync entry: seg=%u sync=%u pipe=%u ft=%d x=%u batchBytes=%zu\n",
+        //            segmentIndex, syncIndex, syncConfig->pipeIndex,
+        //            pipeConfig->size.floatType, pipeConfig->size.x, (size_t)batchBytes);
+        // }
 
         auto start = std::chrono::high_resolution_clock::now();
         const char* syncTypeStr = "UNKNOWN";
@@ -957,10 +1230,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex, this->myStage);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeStr = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan, this->myStage);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, this->myStage, totalElements);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeStr = "SYNC_LOGITS";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex, plan, nullptr);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, plan, nullptr, totalElements);
             } 
             else if (syncConfig->syncType == SYNC_PP_SEND) {
                 syncTypeStr = "PP_SEND";
@@ -981,12 +1254,6 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
             if (threadIndex == 0) {
             auto end = std::chrono::high_resolution_clock::now();
             double elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
-            
-            // 阈值过滤：只打印耗时超过 5ms 的操作
-            if (elapsedMs > 5.0) {
-                printf("⏱️ [Sync Debug] Node %u | Seg %u | %s | Pipe %u | Bytes: %llu | Time: %.2f ms\n", 
-                    nodeConfig->nodeIndex, segmentIndex, syncTypeStr, syncConfig->pipeIndex, (unsigned long long)batchBytes, elapsedMs);
-            }
         }
         }
     }

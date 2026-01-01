@@ -689,6 +689,7 @@ static NnNodeConfig buildLlmNodeInternal(
     ropeSlice.sliceDim = unevenRope.sliceDim;
     ropeSlice.seqLen = unevenRope.seqLen;
     ropeSlice.headDim = unevenRope.headDim;
+    ropeSlice.nKvHeads = unevenRope.nKvHeads;
     ropeSlice.ropeTheta = unevenRope.ropeTheta;
     ropeSlice.cacheSize = unevenRope.cacheSize;
     printf("🔍 [Node %u DEBUG] RoPE Slice: Start=%u, Len=%u, KVDim=%u, HeadDim=%u\n", 
@@ -735,14 +736,17 @@ static NnNodeConfig buildLlmNodeInternal(
 
     // 4. Start Segment (Embedding)
     NnSegmentConfigBuilder start;
-    if (isFirstStage && nodeIndex == 0) { // 假设 Stage 0 的 Node 0 负责 Embedding
+    if (isFirstStage) {
+        // [修改] First Stage 所有节点都负责 Embedding
+        // 1. 先同步 Token (广播: Root -> Stage 0 Workers)
+        // 注意：这里假设 SYNC_WITH_ROOT 能正确处理 Node 0 到 Stage 0 其他节点的广播
+        start.addSync(n->tokenPipeIndex, SYNC_WITH_ROOT);
+
+        // 2. 所有节点本地计算 Embedding (避免传输大的 Embedding 向量)
         start.addOp(OP_EMBEDDING, "embedding", 0, 
             pointerBatchConfig(SRC_PIPE, n->tokenPipeIndex),
             pointerBatchConfig(SRC_PIPE, n->xPipeIndex), 
             n->tokenEmbeddingSize, NnEmbeddingOpConfig{});
-    }
-    if (isFirstStage) {
-        start.addSync(n->xPipeIndex, SYNC_WITH_ROOT);
     }
     nodeBuilder.addSegment(start.build());
 
@@ -929,7 +933,9 @@ static NnNodeConfig buildLlmNodeInternal(
         nodeBuilder.addSegment(rootWaitSeg.build());
     }
 
-    return nodeBuilder.build();
+    NnNodeConfig config = nodeBuilder.build();
+    config.partitionPlan = plan;
+    return config;
 }
 
 LlmNet buildLlmNetUneven(LlmHeader *h, NnUint nNodes, NnUint nBatches, const NnUnevenPartitionPlan* plan) {

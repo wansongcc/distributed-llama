@@ -29,6 +29,10 @@ endif
 	DEPS += nn-vulkan.o
 endif
 
+ifeq ($(TOPK), 1)
+    CXXFLAGS += -DDLLAMA_DEBUG_TOPK_LOGITS=1
+endif
+
 ifeq ($(OS),Windows_NT)
     LIBS += -lws2_32
 	DELETE_CMD = del /f

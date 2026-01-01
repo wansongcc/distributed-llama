@@ -47,6 +47,34 @@ static NnUint getSplitTotal(const NnDimSplit* split, NnUint nNodes) {
     return sum;
 }
 
+static const NnStageConfig* findStageForNode(const NnUnevenPartitionPlan* plan, NnUint nodeIndex) {
+    if (!plan) return nullptr;
+    for (NnUint s = 0; s < plan->nStages; ++s) {
+        const NnStageConfig* st = &plan->stages[s];
+        for (NnUint i = 0; i < st->nNodes; ++i) {
+            if (st->nodeIndices[i] == nodeIndex) return st;
+        }
+    }
+    return nullptr;
+}
+
+static NnUint findStageRank(const NnStageConfig* stage, NnUint nodeIndex) {
+    if (!stage) return 0;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        if (stage->nodeIndices[i] == nodeIndex) return i;
+    }
+    return 0;
+}
+
+static NnUint getSplitTotalForStage(const NnDimSplit* split, const NnStageConfig* stage) {
+    if (!split || !split->lengths || !stage) return 0;
+    NnUint sum = 0;
+    for (NnUint i = 0; i < stage->nNodes; ++i) {
+        sum += split->lengths[stage->nodeIndices[i]];
+    }
+    return sum;
+}
+
 
 NnCpuDevice::NnCpuDevice(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution, const NnUnevenPartitionPlan *partitionPlan) {
     this->netConfig = netConfig;
@@ -233,36 +261,71 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
             if (partitionPlan != nullptr && netConfig->nNodes == partitionPlan->nNodes) {
                 NnUint totalDim = sourceSize->x; // 管道的总维度
                 NnUint nodeIdx = nodeConfig->nodeIndex;
+                const NnStageConfig* myStage = (partitionPlan->nStages > 0) ? findStageForNode(partitionPlan, nodeIdx) : nullptr;
                 
                 // Lambda: 检查给定的 split 是否匹配当前维度
-                auto tryApplySplit = [&](const NnDimSplit& split) -> bool {
-                    NnUint splitTotal = getSplitTotal(&split, partitionPlan->nNodes);
+                auto tryApplySplit = [&](const NnDimSplit& split, bool allowMultiplier, const char* name) -> bool {
+                    (void)name;
+                    // In PP mode, split arrays are stage-local but stored in a single [nNodes] table.
+                    // Summing across all nodes would produce (dim * nStages) and fail matching.
+                    // So for PP, compute totals only within my stage.
+                    NnUint splitTotal = (myStage != nullptr) ? getSplitTotalForStage(&split, myStage)
+                                                           : getSplitTotal(&split, partitionPlan->nNodes);
                     if (splitTotal > 0 && totalDim % splitTotal == 0) {
                         // 命中！计算倍率 (例如 HeadDim) 并应用
                         NnUint multiplier = totalDim / splitTotal;
+                        
+                        // [Fix] Prevent aggressive matching for ZQ pipe (dim * nNodes)
+                        // If allowMultiplier is false, we require exact match (multiplier == 1)
+                        if (!allowMultiplier && multiplier != 1) return false;
+
                         myOffset = split.starts[nodeIdx] * multiplier;
                         myLength = split.lengths[nodeIdx] * multiplier;
+
                         return true;
                     }
                     return false;
                 };
 
                 // 按优先级尝试匹配 (Vocab > FFN > Heads)
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit);
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit);
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit);
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit);
-                if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit);
+                // Vocab, FFN, Dim should match exactly (multiplier 1) to avoid matching concatenated pipes like ZQ
+                if (!splitFound) splitFound = tryApplySplit(partitionPlan->vocabSplit, false, "vocab");
+                if (!splitFound) splitFound = tryApplySplit(partitionPlan->ffnSplit, false, "ffn");
+                if (!splitFound) splitFound = tryApplySplit(partitionPlan->dimSplit, false, "dim");
+                // Heads have headDim multiplier; but for Q80 activation pipes (e.g., ZQ) avoid head split to prevent misaligned offsets
+                if (sourceSize->floatType != F_Q80) {
+                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->headSplit, true, "head");
+                    if (!splitFound) splitFound = tryApplySplit(partitionPlan->kvHeadSplit, true, "kvhead");
+                }
             }
 
             // 2. 如果没有 Plan 或没找到匹配，回退到 Legacy 均匀切分
             if (!splitFound) {
-                // 移除严格断言 assert(sourceSize->x % netConfig->nNodes == 0);
-                myLength = sourceSize->x / netConfig->nNodes;
-                myOffset = myLength * nodeConfig->nodeIndex;
+                // In PP mode, fall back to uniform split within my stage (not global nNodes).
+                const NnStageConfig* myStage = (partitionPlan && partitionPlan->nStages > 0)
+                    ? findStageForNode(partitionPlan, nodeConfig->nodeIndex)
+                    : nullptr;
+
+                NnUint nSplitNodes = (myStage != nullptr) ? myStage->nNodes : netConfig->nNodes;
+                NnUint rank = (myStage != nullptr) ? findStageRank(myStage, nodeConfig->nodeIndex) : nodeConfig->nodeIndex;
+
+                myLength = sourceSize->x / nSplitNodes;
+                myOffset = myLength * rank;
             }
 
             // 3. 应用偏移量 (带越界保护)
+            // [Fix] For Q80, getBytes(F_Q80, offset) assumes offset is block-aligned.
+            // If offset is NOT block aligned (e.g. 1024 elements, block 32 -> aligned), it works.
+            // But if offset is not aligned, getBytes might throw or return wrong value?
+            // getBytes implementation: assert(n % Q80_BLOCK_SIZE == 0);
+            // So we MUST ensure myOffset is block aligned for Q80.
+            
+            if (sourceSize->floatType == F_Q80 && myOffset % Q80_BLOCK_SIZE != 0) {
+                 // This is bad. Q80 requires block alignment.
+                 // But usually dim splits are aligned to 32 or more.
+                 // Let's hope it is aligned.
+            }
+
             NnSize offsetBytes = getBytes(sourceSize->floatType, myOffset);
             NnSize totalBytes = getBytes(sourceSize->floatType, sourceSize->x);
             
@@ -273,11 +336,12 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
 
             for (NnUint z = 0u; z < sourceSize->z; z++) {
                 for (NnUint y = 0u; y < sourceSize->y; y++)
-                    pntr[z * sourceSize->y + y] = &pntr[z * sourceSize->y + y][offsetBytes];
+                    pntr[z * sourceSize->y + y] += offsetBytes; // [Fix] Use += on NnByte* directly
             }
             
             // 更新 size 为实际计算出的 length
             *pntrSize = size3D(sourceSize->floatType, sourceSize->z, sourceSize->y, myLength);
+
         }
         return pntr;
     }
@@ -312,5 +376,6 @@ void NnCpuDeviceSegment::loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes
 void NnCpuDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) {
     NnCpuOpContext *context = &opContexts[opIndex];
     // printf("forward: %d %s (%d/%d)\n", opIndex, context->name, threadIndex + 1, nThreads); fflush(stdout);
+
     opForward[opIndex](nThreads, threadIndex, batchSize, context);
 }

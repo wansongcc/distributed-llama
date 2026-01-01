@@ -67,9 +67,9 @@ public:
     void writeAll(void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
-    void sendToNode(NnUint targetNodeIndex, const void* data, NnSize size);
-    void recvFromNode(NnUint sourceNodeIndex, void* data, NnSize size);
-    int getSocketIndexForNode(NnUint targetNodeIndex) const;
+    void sendToNode(NnUint targetNodeIndex, NnUint myNodeIndex, const void* data, NnSize size);
+    void recvFromNode(NnUint sourceNodeIndex, NnUint myNodeIndex, void* data, NnSize size);
+    int getSocketIndexForNode(NnUint targetNodeIndex, NnUint myNodeIndex) const;
     void resetStats();
     
 };

@@ -186,29 +186,30 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
 
     std::vector<NnStageDef> stages;
     std::string s(ratiosStr);
-    
-    // 1. 兼容性处理：将 | 替换为 ;
+
+    // 1) 支持多种 Stage 分隔符：'*'、';'、'|' 均可
+    // 将所有可能的分隔符统一替换为 '*'
     for (char &c : s) {
-        if (c == '|') c = ';';
+        if (c == ';' || c == '|') c = '*';
     }
 
     std::stringstream ss(s);
     std::string segment;
-    
+
     NnUint totalExplicitLayers = 0;
     std::vector<int> autoLayerIndices; // 记录哪些 Stage 需要自动分配
 
-    // 2. 解析每个 Stage
+    // 2) 解析每个 Stage
     while (std::getline(ss, segment, '*')) {
         if (segment.empty()) continue;
-        
+
         NnStageDef stage;
         stage.nLayers = 0; // 0 表示未指定，稍后自动分配
 
         // 检查冒号 ':' (显式指定层数)
         size_t colonPos = segment.find(':');
         std::string ratioPart = segment;
-        
+
         if (colonPos != std::string::npos) {
             ratioPart = segment.substr(0, colonPos);
             std::string layerPart = segment.substr(colonPos + 1);
@@ -220,7 +221,7 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
             }
         }
 
-        // 解析 TP 比例
+        // 解析 TP 比例（逗号分隔）
         std::stringstream ss2(ratioPart);
         std::string ratio;
         while (std::getline(ss2, ratio, ',')) {
@@ -231,15 +232,15 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
                 throw std::invalid_argument("Invalid ratio value: " + ratio);
             }
         }
-        
+
         if (stage.tpRatios.empty()) {
-             throw std::invalid_argument("Empty stage definition found");
+            throw std::invalid_argument("Empty stage definition found");
         }
-        
+
         if (stage.nLayers == 0) {
-            autoLayerIndices.push_back(stages.size());
+            autoLayerIndices.push_back((int)stages.size());
         }
-        
+
         stages.push_back(stage);
     }
 
@@ -250,11 +251,18 @@ static std::vector<NnStageDef> parseStageDefs(const char *ratiosStr, NnUint nNod
     }
     
     if (totalNodesParsed != nNodes) {
-        throw std::invalid_argument(
-            "Ratios defined " + std::to_string(totalNodesParsed) + 
-            " nodes, but expected " + std::to_string(nNodes) + 
-            " (check --workers count)"
-        );
+        // 构造更友好的错误信息，解释 Ratio 语义并给出示例
+        std::stringstream msg;
+        msg << "Ratios defined " << totalNodesParsed
+            << " nodes, but expected " << nNodes << ".\n"
+            << "• Commas (,) define TP nodes inside one stage.\n"
+            << "• Stages are separated by '*', ';' or '|'.\n"
+            << "• Total nodes across ALL stages must equal nNodes (root + workers).\n"
+            << "Examples:\n"
+            << "  - nNodes=2, two stages: \"1.0*1.0\"\n"
+            << "  - nNodes=4, two stages: \"1.0,1.0*1.0,1.0\"\n"
+            << "Hint: adjust --workers or ratio string accordingly.";
+        throw std::invalid_argument(msg.str());
     }
 
     // 4. [核心修改] 按权重比例分配层数
